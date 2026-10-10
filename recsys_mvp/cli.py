@@ -60,6 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yambda.add_argument("--query-sample-modulo", type=int, default=5000)
     yambda.add_argument("--negatives-per-query", type=int, default=20)
+    yambda.add_argument(
+        "--negative-strategy",
+        choices=("uniform", "popular", "mixed"),
+        default="mixed",
+        help="Sample unknown items uniformly, from the warm-up popularity pool, or half-and-half.",
+    )
+    yambda.add_argument("--popular-pool-size", type=int, default=50000)
     yambda.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -88,6 +95,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.query_sample_modulo,
                 args.negatives_per_query,
                 args.seed,
+                args.negative_strategy,
+                args.popular_pool_size,
             )
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
             return 0

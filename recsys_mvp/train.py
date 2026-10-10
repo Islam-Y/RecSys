@@ -155,8 +155,9 @@ def run_baseline(
             },
             "history_rule": "positive interactions with event_time strictly before the candidate timestamp",
             "timestamp_note": (
-                "Yambda timestamps are relative 5-second bins; the rendered "
-                "1970-based timestamps are an arbitrary origin, not calendar dates."
+                "Yambda timestamps are relative seconds with 5-second granularity; "
+                "the rendered 1970-based timestamps are an arbitrary origin, "
+                "not calendar dates."
                 if history_input_path is not None
                 else None
             ),
