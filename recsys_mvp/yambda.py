@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import duckdb
+
+from recsys_mvp.data import DataContractError, quote_sql_string
+
+
+def prepare_yambda_candidates(
+    input_path: Path,
+    candidate_output: Path,
+    history_output: Path,
+    query_sample_modulo: int = 5_000,
+    negatives_per_query: int = 20,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Prepare a small sampled next-listen ranking task from Yambda-50M.
+
+    Positive labels are Listen+ events. Negatives are uniformly sampled from
+    the item catalog available by the training cutoff and unseen by the user
+    before each query. They are proxy negatives, not observed non-clicks.
+    """
+    source_path = input_path.expanduser().resolve()
+    if not source_path.is_file():
+        raise DataContractError(f"Input file does not exist: {source_path}")
+    if query_sample_modulo < 1:
+        raise DataContractError("--query-sample-modulo must be at least 1.")
+    if negatives_per_query < 1:
+        raise DataContractError("--negatives-per-query must be at least 1.")
+
+    candidate_path = candidate_output.expanduser().resolve()
+    history_path = history_output.expanduser().resolve()
+    if source_path in {candidate_path, history_path}:
+        raise DataContractError("Output paths must not overwrite the input dataset.")
+    if candidate_path == history_path:
+        raise DataContractError("Candidate and history outputs must be different files.")
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.unlink(missing_ok=True)
+    history_path.unlink(missing_ok=True)
+
+    connection = duckdb.connect()
+    try:
+        connection.execute("SET preserve_insertion_order = false")
+        connection.execute(
+            f"""
+            CREATE TEMP VIEW yambda_source AS
+            SELECT
+                CAST(uid AS UBIGINT) AS user_id,
+                CAST(item_id AS UBIGINT) AS item_id,
+                CAST(timestamp AS UBIGINT) AS event_bin,
+                CAST(event_type AS VARCHAR) AS event_type,
+                TRY_CAST(played_ratio_pct AS DOUBLE) AS played_ratio_pct
+            FROM read_parquet({quote_sql_string(str(source_path))})
+            """
+        )
+        source_summary = connection.execute(
+            """
+            SELECT
+                COUNT(*),
+                COUNT(DISTINCT user_id),
+                COUNT(DISTINCT item_id),
+                MIN(event_bin),
+                MAX(event_bin),
+                COUNT(*) FILTER (
+                    WHERE event_type = 'listen' AND played_ratio_pct > 50
+                )
+            FROM yambda_source
+            """
+        ).fetchone()
+        event_counts = dict(
+            connection.execute(
+                "SELECT event_type, COUNT(*) FROM yambda_source GROUP BY 1 ORDER BY 1"
+            ).fetchall()
+        )
+
+        connection.execute(
+            """
+            CREATE TEMP TABLE positive_history AS
+            SELECT DISTINCT user_id, item_id, event_bin
+            FROM yambda_source
+            WHERE event_type = 'listen' AND played_ratio_pct > 50
+            """
+        )
+        history_event_count = connection.execute(
+            "SELECT COUNT(*) FROM positive_history"
+        ).fetchone()[0]
+        if history_event_count == 0:
+            raise DataContractError("Yambda input contains no Listen+ events (>50% played).")
+
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE selected_queries AS
+            SELECT
+                user_id,
+                event_bin,
+                CAST(user_id AS VARCHAR) || ':' || CAST(event_bin AS VARCHAR) AS query_id
+            FROM positive_history
+            GROUP BY user_id, event_bin
+            HAVING hash(user_id, event_bin, {int(seed)}) % {int(query_sample_modulo)} = 0
+            """
+        )
+        query_count = connection.execute(
+            "SELECT COUNT(*) FROM selected_queries"
+        ).fetchone()[0]
+        if query_count < 3:
+            raise DataContractError(
+                f"Only {query_count} query timestamps were sampled. Lower "
+                "--query-sample-modulo and try again."
+            )
+
+        train_cutoff = connection.execute(
+            "SELECT quantile_disc(event_bin, 0.70) FROM selected_queries"
+        ).fetchone()[0]
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE item_catalog AS
+            SELECT
+                item_id,
+                first_seen_bin,
+                CAST(ROW_NUMBER() OVER (ORDER BY item_id) - 1 AS UBIGINT) AS catalog_index
+            FROM (
+                SELECT item_id, MIN(event_bin) AS first_seen_bin
+                FROM yambda_source
+                WHERE event_bin <= {int(train_cutoff)}
+                GROUP BY item_id
+            )
+            """
+        )
+        catalog_size = connection.execute(
+            "SELECT COUNT(*) FROM item_catalog"
+        ).fetchone()[0]
+        if catalog_size < 2:
+            raise DataContractError("The training-period item catalog is too small to sample negatives.")
+
+        connection.execute(
+            """
+            CREATE TEMP TABLE sampled_targets AS
+            SELECT DISTINCT q.user_id, q.event_bin, q.query_id, h.item_id
+            FROM selected_queries AS q
+            JOIN positive_history AS h USING (user_id, event_bin)
+            JOIN item_catalog AS catalog USING (item_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TEMP TABLE candidate_queries AS
+            SELECT DISTINCT user_id, event_bin, query_id
+            FROM sampled_targets
+            """
+        )
+        usable_query_count = connection.execute(
+            "SELECT COUNT(*) FROM candidate_queries"
+        ).fetchone()[0]
+        if usable_query_count < 3:
+            raise DataContractError(
+                "Fewer than three sampled queries have positive items in the "
+                "training-period catalog. Lower --query-sample-modulo and retry."
+            )
+
+        connection.execute(
+            """
+            CREATE TEMP TABLE seen_before_query AS
+            SELECT q.query_id, e.item_id
+            FROM candidate_queries AS q
+            JOIN yambda_source AS e
+              ON e.user_id = q.user_id
+             AND e.event_bin < q.event_bin
+            GROUP BY q.query_id, e.item_id
+            """
+        )
+        proposals_per_query = negatives_per_query * 8
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE sampled_negatives AS
+            WITH proposals AS (
+                SELECT
+                    q.user_id,
+                    q.event_bin,
+                    q.query_id,
+                    slots.slot,
+                    CAST(
+                        hash(q.user_id, q.event_bin, slots.slot, {int(seed)})
+                        % {int(catalog_size)} AS UBIGINT
+                    ) AS catalog_index
+                FROM candidate_queries AS q
+                CROSS JOIN range(0, {int(proposals_per_query)}) AS slots(slot)
+            ), mapped AS (
+                SELECT p.user_id, p.event_bin, p.query_id, p.slot, c.item_id
+                FROM proposals AS p
+                JOIN item_catalog AS c USING (catalog_index)
+                WHERE c.first_seen_bin <= p.event_bin
+            ), eligible AS (
+                SELECT m.*
+                FROM mapped AS m
+                LEFT JOIN seen_before_query AS seen
+                  ON seen.query_id = m.query_id AND seen.item_id = m.item_id
+                LEFT JOIN sampled_targets AS target
+                  ON target.query_id = m.query_id AND target.item_id = m.item_id
+                WHERE seen.query_id IS NULL AND target.query_id IS NULL
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY m.query_id, m.item_id ORDER BY m.slot
+                ) = 1
+            )
+            SELECT user_id, event_bin, query_id, item_id
+            FROM eligible
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY query_id ORDER BY slot, item_id
+            ) <= {int(negatives_per_query)}
+            """
+        )
+
+        negative_count = connection.execute(
+            "SELECT COUNT(*) FROM sampled_negatives"
+        ).fetchone()[0]
+        if negative_count == 0:
+            raise DataContractError("Negative sampling returned no eligible candidates.")
+
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    CAST(user_id AS VARCHAR) AS user_id,
+                    CAST(item_id AS VARCHAR) AS item_id,
+                    make_timestamp(CAST(event_bin AS BIGINT) * 5000000) AS timestamp,
+                    CAST(1 AS INTEGER) AS label,
+                    query_id
+                FROM sampled_targets
+                UNION ALL
+                SELECT
+                    CAST(user_id AS VARCHAR) AS user_id,
+                    CAST(item_id AS VARCHAR) AS item_id,
+                    make_timestamp(CAST(event_bin AS BIGINT) * 5000000) AS timestamp,
+                    CAST(0 AS INTEGER) AS label,
+                    query_id
+                FROM sampled_negatives
+            ) TO {quote_sql_string(str(candidate_path))}
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    CAST(user_id AS VARCHAR) AS user_id,
+                    CAST(item_id AS VARCHAR) AS item_id,
+                    make_timestamp(CAST(event_bin AS BIGINT) * 5000000) AS event_time
+                FROM positive_history
+            ) TO {quote_sql_string(str(history_path))}
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+
+        result: dict[str, Any] = {
+            "source": str(source_path),
+            "dataset": "Yambda-50M flat multi_event",
+            "license": "Apache-2.0; dataset card limits publication to scientific and research purposes",
+            "source_statistics": {
+                "rows": source_summary[0],
+                "users": source_summary[1],
+                "items": source_summary[2],
+                "minimum_event_bin": source_summary[3],
+                "maximum_event_bin": source_summary[4],
+                "listen_plus_rows": source_summary[5],
+                "event_types": event_counts,
+            },
+            "task": {
+                "positive": "listen events with played_ratio_pct > 50",
+                "negative": "uniformly sampled catalog items with no prior user interaction",
+                "negative_semantics": "sampled unobserved items, not observed non-clicks or dislikes",
+                "timestamp_conversion": "source time uses relative 5-second bins; conversion adds no real calendar meaning",
+                "sampling": {
+                    "query_hash_modulo": query_sample_modulo,
+                    "seed": seed,
+                    "requested_negatives_per_query": negatives_per_query,
+                    "proposal_multiplier": 8,
+                    "query_timestamps_sampled": query_count,
+                    "queries_with_warm_positive_items": usable_query_count,
+                    "positive_candidates": connection.execute(
+                        "SELECT COUNT(*) FROM sampled_targets"
+                    ).fetchone()[0],
+                    "negative_candidates": negative_count,
+                },
+                "catalog": {
+                    "eligible_item_count": catalog_size,
+                    "training_cutoff_event_bin": train_cutoff,
+                },
+            },
+            "outputs": {
+                "candidates": str(candidate_path),
+                "positive_history": str(history_path),
+            },
+        }
+        metadata_path = candidate_path.with_suffix(candidate_path.suffix + ".metadata.json")
+        metadata_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False, default=str) + "\n",
+            encoding="utf-8",
+        )
+        return result
+    finally:
+        connection.close()

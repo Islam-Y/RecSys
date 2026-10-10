@@ -38,6 +38,7 @@ def run_baseline(
     timestamp_column: str = "timestamp",
     label_column: str = "label",
     query_column: str = "query_id",
+    history_input_path: Path | None = None,
 ) -> dict[str, Any]:
     connection = duckdb.connect()
     try:
@@ -51,7 +52,7 @@ def run_baseline(
             label_column,
             query_column,
         )
-        build_feature_table(connection)
+        build_feature_table(connection, history_input_path)
 
         total_rows, train_cutoff, validation_cutoff = connection.execute(
             """
@@ -138,6 +139,11 @@ def run_baseline(
 
     metrics: dict[str, Any] = {
         "input": str(input_path.expanduser().resolve()),
+        "history_input": (
+            str(history_input_path.expanduser().resolve())
+            if history_input_path is not None
+            else None
+        ),
         "split": {
             "strategy": "chronological global 70/15/15 by timestamp quantiles",
             "train_cutoff_inclusive": train_cutoff,
@@ -148,6 +154,12 @@ def run_baseline(
                 "test": split_sizes[2],
             },
             "history_rule": "positive interactions with event_time strictly before the candidate timestamp",
+            "timestamp_note": (
+                "Yambda timestamps are relative 5-second bins; the rendered "
+                "1970-based timestamps are an arbitrary origin, not calendar dates."
+                if history_input_path is not None
+                else None
+            ),
         },
         "features": feature_columns,
         "categorical_features": categorical_columns,

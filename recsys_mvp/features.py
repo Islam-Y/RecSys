@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import duckdb
+from pathlib import Path
+
+from recsys_mvp.data import quote_sql_string
 
 
 WINDOWS_DAYS = (1, 7, 30)
@@ -61,15 +64,33 @@ def _create_entity_features(
     )
 
 
-def build_feature_table(connection: duckdb.DuckDBPyConnection) -> None:
-    connection.execute(
-        """
-        CREATE TEMP VIEW positive_history AS
-        SELECT user_id, item_id, event_time
-        FROM examples
-        WHERE label = 1
-        """
-    )
+def build_feature_table(
+    connection: duckdb.DuckDBPyConnection,
+    history_input_path: Path | None = None,
+) -> None:
+    if history_input_path is None:
+        connection.execute(
+            """
+            CREATE TEMP VIEW positive_history AS
+            SELECT user_id, item_id, event_time
+            FROM examples
+            WHERE label = 1
+            """
+        )
+    else:
+        history_path = history_input_path.expanduser().resolve()
+        if not history_path.is_file():
+            raise FileNotFoundError(f"History input file does not exist: {history_path}")
+        connection.execute(
+            f"""
+            CREATE TEMP VIEW positive_history AS
+            SELECT
+                CAST(user_id AS VARCHAR) AS user_id,
+                CAST(item_id AS VARCHAR) AS item_id,
+                TRY_CAST(event_time AS TIMESTAMP) AS event_time
+            FROM read_parquet({quote_sql_string(str(history_path))})
+            """
+        )
     _create_entity_features(
         connection,
         "user_features",
