@@ -459,6 +459,64 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     "automatic_recall@3": cell["automatic_metrics"][
                                         "recall@3"
                                     ],
+                                    "manual_ndcg_selected_ndcg@3": cell[
+                                        "manual_ndcg_selected_metrics"
+                                    ]["ndcg@3"],
+                                    "automatic_ndcg_selected_ndcg@3": cell[
+                                        "automatic_ndcg_selected_metrics"
+                                    ]["ndcg@3"],
+                                    "ranker_manual_ndcg@3": cell[
+                                        "ranker_manual_metrics"
+                                    ]["ndcg@3"],
+                                    "ranker_manual_recall@3": cell[
+                                        "ranker_manual_metrics"
+                                    ]["recall@3"],
+                                    "ranker_automatic_ndcg@3": cell[
+                                        "ranker_automatic_metrics"
+                                    ]["ndcg@3"],
+                                    "ranker_automatic_recall@3": cell[
+                                        "ranker_automatic_metrics"
+                                    ]["recall@3"],
+                                    "ranker_minus_classifier_manual_ndcg@3": cell[
+                                        "ranker_minus_classifier"
+                                    ]["manual"]["ndcg@3"][
+                                        "ranker_minus_classifier_ndcg@3"
+                                    ],
+                                    "ranker_minus_classifier_manual_interval": cell[
+                                        "ranker_minus_classifier"
+                                    ]["manual"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_minus_classifier_auto_ndcg@3": cell[
+                                        "ranker_minus_classifier"
+                                    ]["automatic"]["ndcg@3"][
+                                        "ranker_minus_classifier_ndcg@3"
+                                    ],
+                                    "ranker_minus_classifier_auto_interval": cell[
+                                        "ranker_minus_classifier"
+                                    ]["automatic"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_minus_ndcg_selected_manual_ndcg@3": cell[
+                                        "ranker_minus_ndcg_selected_classifier"
+                                    ]["manual"]["ndcg@3"][
+                                        "ranker_minus_ndcg_selected_classifier_ndcg@3"
+                                    ],
+                                    "ranker_minus_ndcg_selected_manual_interval": cell[
+                                        "ranker_minus_ndcg_selected_classifier"
+                                    ]["manual"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_minus_ndcg_selected_auto_ndcg@3": cell[
+                                        "ranker_minus_ndcg_selected_classifier"
+                                    ]["automatic"]["ndcg@3"][
+                                        "ranker_minus_ndcg_selected_classifier_ndcg@3"
+                                    ],
+                                    "ranker_minus_ndcg_selected_auto_interval": cell[
+                                        "ranker_minus_ndcg_selected_classifier"
+                                    ]["automatic"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
                                 }
                                 for cell in matrix["cells"]
                             ],
@@ -486,6 +544,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     ]["automatic"]["ndcg@3"][
                                         "bootstrap_95_percent_interval"
                                     ],
+                                    "ranker_manual_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["manual_ranker"]["ndcg@3"][
+                                        "training_pool_change_ndcg@3"
+                                    ],
+                                    "ranker_manual_interval": effect[
+                                        "paired_metrics"
+                                    ]["manual_ranker"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_automatic_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["automatic_ranker"]["ndcg@3"][
+                                        "training_pool_change_ndcg@3"
+                                    ],
+                                    "ranker_automatic_interval": effect[
+                                        "paired_metrics"
+                                    ]["automatic_ranker"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
                                 }
                                 for effect in matrix["training_seed_effects"]
                             ],
@@ -511,6 +589,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     "automatic_interval": effect[
                                         "paired_metrics"
                                     ]["automatic"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_manual_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["manual_ranker"]["ndcg@3"][
+                                        "audit_pool_change_ndcg@3"
+                                    ],
+                                    "ranker_manual_interval": effect[
+                                        "paired_metrics"
+                                    ]["manual_ranker"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                    "ranker_automatic_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["automatic_ranker"]["ndcg@3"][
+                                        "audit_pool_change_ndcg@3"
+                                    ],
+                                    "ranker_automatic_interval": effect[
+                                        "paired_metrics"
+                                    ]["automatic_ranker"]["ndcg@3"][
                                         "bootstrap_95_percent_interval"
                                     ],
                                 }

@@ -9,10 +9,11 @@ from typing import Any
 import duckdb
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier, CatBoostRanker, Pool
 
 from recsys_mvp.auto_features import SEARCH_WINDOWS_DAYS, generate_feature_specs
 from recsys_mvp.data import DataContractError, quote_sql_string
-from recsys_mvp.evaluation import evaluate_predictions
+from recsys_mvp.evaluation import evaluate_predictions, evaluate_ranking_scores
 from recsys_mvp.feature_search import (
     CATEGORICAL_FEATURES,
     MANUAL_FEATURE_NAMES,
@@ -376,6 +377,143 @@ def _evaluate_model(
     )
 
 
+def _ordered_group_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    return rows.sort_values(
+        ["query_id", "event_time", "label", "item_id"],
+        ascending=[True, True, False, True],
+        kind="stable",
+    )
+
+
+def _grouped_pool(rows: pd.DataFrame, feature_names: tuple[str, ...]):
+    ordered_rows = _ordered_group_rows(rows)
+    pool = Pool(
+        data=ordered_rows[[*CATEGORICAL_FEATURES, *feature_names]],
+        label=ordered_rows["label"].astype(float),
+        group_id=ordered_rows["query_id"].astype(str),
+        cat_features=list(CATEGORICAL_FEATURES),
+    )
+    return pool, ordered_rows
+
+
+def _fit_grouped_classifier_and_score(
+    rows: pd.DataFrame,
+    feature_names: tuple[str, ...],
+    train_mask: pd.Series,
+    score_mask: pd.Series,
+    fixed_iterations: int | None = None,
+) -> tuple[CatBoostClassifier, dict[str, Any]]:
+    train_pool, _ = _grouped_pool(rows.loc[train_mask], feature_names)
+    score_pool, score_rows = _grouped_pool(rows.loc[score_mask], feature_names)
+    model = CatBoostClassifier(
+        iterations=fixed_iterations or 500,
+        depth=8,
+        learning_rate=0.05,
+        loss_function="Logloss",
+        eval_metric="NDCG:top=3;type=Base",
+        random_seed=42,
+        verbose=False,
+        allow_writing_files=False,
+        thread_count=4,
+    )
+    fit_kwargs: dict[str, Any] = {}
+    if fixed_iterations is None:
+        fit_kwargs = {
+            "eval_set": score_pool,
+            "early_stopping_rounds": 50,
+            "use_best_model": True,
+        }
+    started = time.perf_counter()
+    model.fit(train_pool, **fit_kwargs)
+    fit_seconds = round(time.perf_counter() - started, 3)
+    scores = model.predict_proba(score_pool)[:, 1]
+    metrics = evaluate_predictions(
+        score_rows, pd.Series(scores, index=score_rows.index)
+    )
+    return model, {
+        "features": list(feature_names),
+        "numeric_feature_count": len(feature_names),
+        "iterations": fixed_iterations or model.get_best_iteration() + 1,
+        "fit_seconds": fit_seconds,
+        "rows": len(score_rows),
+        "metrics": metrics,
+    }
+
+
+def _fit_ranker_and_score(
+    rows: pd.DataFrame,
+    feature_names: tuple[str, ...],
+    train_mask: pd.Series,
+    score_mask: pd.Series,
+    fixed_iterations: int | None = None,
+) -> tuple[CatBoostRanker, dict[str, Any]]:
+    train_pool, _ = _grouped_pool(rows.loc[train_mask], feature_names)
+    score_pool, score_rows = _grouped_pool(rows.loc[score_mask], feature_names)
+    model = CatBoostRanker(
+        iterations=fixed_iterations or 500,
+        depth=8,
+        learning_rate=0.05,
+        loss_function="YetiRank:mode=NDCG;top=3",
+        eval_metric="NDCG:top=3;type=Base",
+        random_seed=42,
+        verbose=False,
+        allow_writing_files=False,
+        thread_count=4,
+    )
+    fit_kwargs: dict[str, Any] = {}
+    if fixed_iterations is None:
+        fit_kwargs = {
+            "eval_set": score_pool,
+            "early_stopping_rounds": 50,
+            "use_best_model": True,
+        }
+    started = time.perf_counter()
+    model.fit(train_pool, **fit_kwargs)
+    fit_seconds = round(time.perf_counter() - started, 3)
+    scores = np.asarray(model.predict(score_pool), dtype=float).reshape(-1)
+    metrics = evaluate_ranking_scores(
+        score_rows,
+        score_rows["label"].astype(int),
+        pd.Series(scores, index=score_rows.index),
+        k=3,
+    )
+    return model, {
+        "features": list(feature_names),
+        "numeric_feature_count": len(feature_names),
+        "iterations": fixed_iterations or model.get_best_iteration() + 1,
+        "fit_seconds": fit_seconds,
+        "rows": len(score_rows),
+        "metrics": metrics,
+    }
+
+
+def _evaluate_ranker(
+    model: CatBoostRanker,
+    rows: pd.DataFrame,
+    feature_names: tuple[str, ...],
+) -> tuple[
+    dict[str, Any],
+    dict[tuple[str, str], float],
+    dict[tuple[str, str], float],
+]:
+    ordered_rows = _ordered_group_rows(rows)
+    scores = np.asarray(
+        model.predict(ordered_rows[[*CATEGORICAL_FEATURES, *feature_names]]),
+        dtype=float,
+    ).reshape(-1)
+    metrics = evaluate_ranking_scores(
+        ordered_rows,
+        ordered_rows["label"].astype(int),
+        pd.Series(scores, index=ordered_rows.index),
+        k=3,
+    )
+    return (
+        metrics,
+        _query_ndcg_values(ordered_rows, scores),
+        _query_recall_values(ordered_rows, scores),
+    )
+
+
 def _fit_train_audit_matrix(
     variants: tuple[tuple[str, Path], ...],
     event_history_path: Path,
@@ -475,6 +613,46 @@ def _fit_train_audit_matrix(
             audit_mask,
             automatic_selection["iterations"],
         )
+        _, manual_ndcg_selection = _fit_grouped_classifier_and_score(
+            rows, MANUAL_FEATURE_NAMES, train_mask, selection_mask
+        )
+        _, automatic_ndcg_selection = _fit_grouped_classifier_and_score(
+            rows, selected_features, train_mask, selection_mask
+        )
+        manual_ndcg_model, _ = _fit_grouped_classifier_and_score(
+            rows,
+            MANUAL_FEATURE_NAMES,
+            train_and_selection,
+            audit_mask,
+            manual_ndcg_selection["iterations"],
+        )
+        automatic_ndcg_model, _ = _fit_grouped_classifier_and_score(
+            rows,
+            selected_features,
+            train_and_selection,
+            audit_mask,
+            automatic_ndcg_selection["iterations"],
+        )
+        _, manual_ranker_selection = _fit_ranker_and_score(
+            rows, MANUAL_FEATURE_NAMES, train_mask, selection_mask
+        )
+        _, automatic_ranker_selection = _fit_ranker_and_score(
+            rows, selected_features, train_mask, selection_mask
+        )
+        manual_ranker, _ = _fit_ranker_and_score(
+            rows,
+            MANUAL_FEATURE_NAMES,
+            train_and_selection,
+            audit_mask,
+            manual_ranker_selection["iterations"],
+        )
+        automatic_ranker, _ = _fit_ranker_and_score(
+            rows,
+            selected_features,
+            train_and_selection,
+            audit_mask,
+            automatic_ranker_selection["iterations"],
+        )
         model_specs = {
             "manual": {
                 "model": manual_model,
@@ -486,6 +664,26 @@ def _fit_train_audit_matrix(
                 "features": selected_features,
                 "selection": automatic_selection,
             },
+            "manual_ndcg_selected": {
+                "model": manual_ndcg_model,
+                "features": MANUAL_FEATURE_NAMES,
+                "selection": manual_ndcg_selection,
+            },
+            "automatic_ndcg_selected": {
+                "model": automatic_ndcg_model,
+                "features": selected_features,
+                "selection": automatic_ndcg_selection,
+            },
+            "manual_ranker": {
+                "model": manual_ranker,
+                "features": MANUAL_FEATURE_NAMES,
+                "selection": manual_ranker_selection,
+            },
+            "automatic_ranker": {
+                "model": automatic_ranker,
+                "features": selected_features,
+                "selection": automatic_ranker_selection,
+            },
         }
         training_runs.append(
             {
@@ -496,6 +694,10 @@ def _fit_train_audit_matrix(
                 "training_cutoffs": [str(value) for value in common_cutoffs],
                 "manual_selection": manual_selection,
                 "automatic_selection": automatic_selection,
+                "manual_ranker_selection": manual_ranker_selection,
+                "automatic_ranker_selection": automatic_ranker_selection,
+                "manual_ndcg_selected_selection": manual_ndcg_selection,
+                "automatic_ndcg_selected_selection": automatic_ndcg_selection,
                 "feature_generation_seconds": train_matrix[
                     "feature_generation_seconds"
                 ],
@@ -507,9 +709,18 @@ def _fit_train_audit_matrix(
             cell_metrics = {}
             cell_query_metrics = {}
             for model_name, model_data in model_specs.items():
-                current_metrics, current_ndcg, current_recall = _evaluate_model(
-                    model_data["model"], audit_rows, model_data["features"]
-                )
+                if model_name.endswith("_ranker"):
+                    current_metrics, current_ndcg, current_recall = _evaluate_ranker(
+                        model_data["model"], audit_rows, model_data["features"]
+                    )
+                elif model_name.endswith("_ndcg_selected"):
+                    current_metrics, current_ndcg, current_recall = _evaluate_model(
+                        model_data["model"], audit_rows, model_data["features"]
+                    )
+                else:
+                    current_metrics, current_ndcg, current_recall = _evaluate_model(
+                        model_data["model"], audit_rows, model_data["features"]
+                    )
                 cell_metrics[model_name] = current_metrics
                 cell_query_metrics[model_name] = {
                     "ndcg@3": current_ndcg,
@@ -520,12 +731,54 @@ def _fit_train_audit_matrix(
                 cell_query_metrics["automatic"]["ndcg@3"],
                 metric_name="automatic_minus_manual_ndcg@3",
             )
+            ranker_paired = _paired_bootstrap(
+                cell_query_metrics["manual_ranker"]["ndcg@3"],
+                cell_query_metrics["automatic_ranker"]["ndcg@3"],
+                metric_name="automatic_minus_manual_ndcg@3",
+            )
+            objective_comparisons = {}
+            for feature_set, classifier_name, ranker_name in (
+                ("manual", "manual", "manual_ranker"),
+                ("automatic", "automatic", "automatic_ranker"),
+            ):
+                objective_comparisons[feature_set] = {
+                    metric_name: _paired_bootstrap(
+                        cell_query_metrics[classifier_name][metric_name],
+                        cell_query_metrics[ranker_name][metric_name],
+                        metric_name=f"ranker_minus_classifier_{metric_name}",
+                    )
+                    for metric_name in ("ndcg@3", "recall@3")
+                }
+            ndcg_selected_comparisons = {}
+            for feature_set, classifier_name, ranker_name in (
+                ("manual", "manual_ndcg_selected", "manual_ranker"),
+                ("automatic", "automatic_ndcg_selected", "automatic_ranker"),
+            ):
+                ndcg_selected_comparisons[feature_set] = {
+                    metric_name: _paired_bootstrap(
+                        cell_query_metrics[classifier_name][metric_name],
+                        cell_query_metrics[ranker_name][metric_name],
+                        metric_name=f"ranker_minus_ndcg_selected_classifier_{metric_name}",
+                    )
+                    for metric_name in ("ndcg@3", "recall@3")
+                }
             cells[(train_matrix["label"], audit_matrix["label"])] = {
                 "train_variant": train_matrix["label"],
                 "audit_variant": audit_matrix["label"],
                 "manual_metrics": cell_metrics["manual"],
                 "automatic_metrics": cell_metrics["automatic"],
+                "manual_ndcg_selected_metrics": cell_metrics[
+                    "manual_ndcg_selected"
+                ],
+                "automatic_ndcg_selected_metrics": cell_metrics[
+                    "automatic_ndcg_selected"
+                ],
+                "ranker_manual_metrics": cell_metrics["manual_ranker"],
+                "ranker_automatic_metrics": cell_metrics["automatic_ranker"],
                 "paired_automatic_minus_manual": paired,
+                "ranker_paired_automatic_minus_manual": ranker_paired,
+                "ranker_minus_classifier": objective_comparisons,
+                "ranker_minus_ndcg_selected_classifier": ndcg_selected_comparisons,
                 "query_metrics": cell_query_metrics,
             }
 
@@ -538,7 +791,14 @@ def _fit_train_audit_matrix(
         metric_prefix: str,
     ) -> dict[str, Any]:
         result = {}
-        for model_name in ("manual", "automatic"):
+        for model_name in (
+            "manual",
+            "automatic",
+            "manual_ndcg_selected",
+            "automatic_ndcg_selected",
+            "manual_ranker",
+            "automatic_ranker",
+        ):
             result[model_name] = {}
             for metric_name in ("ndcg@3", "recall@3"):
                 result[model_name][metric_name] = _paired_bootstrap(
@@ -590,7 +850,14 @@ def _fit_train_audit_matrix(
                 "audit_reference": audit_reference,
                 "metrics": {},
             }
-            for model_name in ("manual", "automatic"):
+            for model_name in (
+                "manual",
+                "automatic",
+                "manual_ndcg_selected",
+                "automatic_ndcg_selected",
+                "manual_ranker",
+                "automatic_ranker",
+            ):
                 interaction["metrics"][model_name] = {}
                 for metric_name in ("ndcg@3", "recall@3"):
                     # Difference in training-pool effects between the comparison
@@ -658,8 +925,44 @@ def _fit_train_audit_matrix(
                     ),
                     "audit": cell["automatic_metrics"],
                 },
+                "manual_ndcg_selected": {
+                    "selection": next(
+                        run["manual_ndcg_selected_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["manual_ndcg_selected_metrics"],
+                },
+                "automatic_ndcg_selected": {
+                    "selection": next(
+                        run["automatic_ndcg_selected_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["automatic_ndcg_selected_metrics"],
+                },
+                "ranker_manual": {
+                    "selection": next(
+                        run["manual_ranker_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["ranker_manual_metrics"],
+                },
+                "ranker_automatic": {
+                    "selection": next(
+                        run["automatic_ranker_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["ranker_automatic_metrics"],
+                },
                 "paired_automatic_minus_manual": cell[
                     "paired_automatic_minus_manual"
+                ],
+                "ranker_minus_classifier": cell["ranker_minus_classifier"],
+                "ranker_minus_ndcg_selected_classifier": cell[
+                    "ranker_minus_ndcg_selected_classifier"
                 ],
                 "audit_query_ndcg": {
                     "manual": cell["query_metrics"]["manual"]["ndcg@3"],
@@ -678,6 +981,21 @@ def _fit_train_audit_matrix(
             }
         )
     return {
+        "model_comparison": {
+            "classifier_loss": "Logloss",
+            "classifier_selection_metric": "Logloss (existing baseline)",
+            "controlled_classifier_loss": "Logloss",
+            "controlled_classifier_selection_metric": "NDCG:top=3;type=Base",
+            "ranker_loss": "YetiRank:mode=NDCG;top=3",
+            "ranker_selection_metric": "NDCG:top=3;type=Base",
+            "ranker_group_id": "query_id",
+            "ranker_group_order": "rows sorted by query_id before fitting and scoring",
+            "feature_sets": {
+                "manual": list(MANUAL_FEATURE_NAMES),
+                "automatic": list(selected_features),
+            },
+            "model_seed": 42,
+        },
         "training_variants": [matrix["label"] for matrix in matrices],
         "audit_variants": [matrix["label"] for matrix in matrices],
         "training_cutoffs": [str(value) for value in common_cutoffs],
