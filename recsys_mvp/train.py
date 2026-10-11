@@ -54,6 +54,7 @@ def run_baseline(
     evaluate_test: bool = True,
     train_quantile: float = 0.70,
     validation_quantile: float = 0.85,
+    entity_windows_days: dict[str, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
     if not 0 < train_quantile < validation_quantile < 1:
         raise DataContractError(
@@ -126,6 +127,7 @@ def run_baseline(
             windows_days,
             include_trends,
             include_recency,
+            entity_windows_days,
         )
         feature_generation_seconds = time.perf_counter() - feature_started
 
@@ -234,6 +236,12 @@ def run_baseline(
         "features": feature_columns,
         "feature_config": {
             "windows_days": list(sorted(set(windows_days))),
+            "entity_windows_days": {
+                prefix: list(
+                    sorted(set((entity_windows_days or {}).get(prefix, windows_days)))
+                )
+                for prefix in ("user", "item", "pair")
+            },
             "include_7d_trend_features": include_trends,
             "include_days_since_last_listen_features": include_recency,
         },

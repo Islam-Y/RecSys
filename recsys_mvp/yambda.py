@@ -9,6 +9,82 @@ import duckdb
 from recsys_mvp.data import DataContractError, quote_sql_string
 
 
+def prepare_cold_pair_candidates(
+    input_path: Path,
+    history_input_path: Path,
+    output_path: Path,
+    lookback_days: int = 180,
+) -> dict[str, Any]:
+    """Keep queries whose positive items have no prior Listen+ in the lookback."""
+    source = input_path.expanduser().resolve()
+    history = history_input_path.expanduser().resolve()
+    destination = output_path.expanduser().resolve()
+    if lookback_days < 1:
+        raise DataContractError("--lookback-days must be at least 1.")
+    for path in (source, history):
+        if not path.is_file():
+            raise DataContractError(f"Input file does not exist: {path}")
+    if destination in {source, history}:
+        raise DataContractError("Cold-pair output must not overwrite an input.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE repeated_queries AS
+            SELECT DISTINCT c.query_id
+            FROM read_parquet({quote_sql_string(str(source))}) AS c
+            JOIN read_parquet({quote_sql_string(str(history))}) AS h
+              ON c.user_id = h.user_id
+             AND c.item_id = h.item_id
+             AND h.event_time < c.timestamp
+             AND h.event_time >= c.timestamp - INTERVAL '{lookback_days} days'
+            WHERE c.label = 1
+            """
+        )
+        excluded_queries = connection.execute(
+            "SELECT COUNT(*) FROM repeated_queries"
+        ).fetchone()[0]
+        connection.execute(
+            f"""
+            COPY (
+                SELECT c.*
+                FROM read_parquet({quote_sql_string(str(source))}) AS c
+                ANTI JOIN repeated_queries USING (query_id)
+            ) TO {quote_sql_string(str(destination))}
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        rows, queries, positives = connection.execute(
+            f"""
+            SELECT COUNT(*), COUNT(DISTINCT query_id), SUM(label)
+            FROM read_parquet({quote_sql_string(str(destination))})
+            """
+        ).fetchone()
+        report = {
+            "source": str(source),
+            "history_input": str(history),
+            "output": str(destination),
+            "lookback_days": lookback_days,
+            "excluded_queries": excluded_queries,
+            "rows": rows,
+            "queries": queries,
+            "positives": positives,
+            "rule": (
+                "exclude each query with any positive item previously "
+                "listened to within lookback"
+            ),
+        }
+        destination.with_suffix(destination.suffix + ".metadata.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return report
+    finally:
+        connection.close()
+
+
 def prepare_yambda_candidates(
     input_path: Path,
     candidate_output: Path,

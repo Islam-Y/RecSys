@@ -124,13 +124,29 @@ def build_feature_table(
     windows_days: tuple[int, ...] = WINDOWS_DAYS,
     include_trends: bool = False,
     include_recency: bool = False,
+    entity_windows_days: dict[str, tuple[int, ...]] | None = None,
 ) -> None:
     windows_days = tuple(sorted(set(windows_days)))
     if not windows_days or any(days < 1 for days in windows_days):
         raise DataContractError("Feature windows must be positive whole days.")
-    if include_trends and not {7, 14}.issubset(windows_days):
+    windows_by_entity = {
+        prefix: tuple(
+            sorted(set((entity_windows_days or {}).get(prefix, windows_days)))
+        )
+        for prefix in ("user", "item", "pair")
+    }
+    if entity_windows_days and set(entity_windows_days) - set(windows_by_entity):
+        raise DataContractError("Entity windows must use user, item, or pair keys.")
+    if any(
+        not values or any(days < 1 for days in values)
+        for values in windows_by_entity.values()
+    ):
+        raise DataContractError("Entity feature windows must be positive whole days.")
+    if include_trends and any(
+        not {7, 14}.issubset(values) for values in windows_by_entity.values()
+    ):
         raise DataContractError(
-            "The 7-day trend requires both 7-day and 14-day windows."
+            "The 7-day trend requires both 7-day and 14-day windows for each entity."
         )
     if history_input_path is None:
         connection.execute(
@@ -160,7 +176,7 @@ def build_feature_table(
         "user_features",
         ("user_id",),
         "user",
-        windows_days,
+        windows_by_entity["user"],
         include_trends,
         include_recency,
     )
@@ -169,7 +185,7 @@ def build_feature_table(
         "item_features",
         ("item_id",),
         "item",
-        windows_days,
+        windows_by_entity["item"],
         include_trends,
         include_recency,
         True,
@@ -179,20 +195,21 @@ def build_feature_table(
         "pair_features",
         ("user_id", "item_id"),
         "pair",
-        windows_days,
+        windows_by_entity["pair"],
         include_trends,
         include_recency,
     )
     feature_projection_columns = []
     for prefix in ("user", "item", "pair"):
-        entity_columns = [f"{prefix}_events_{days}d" for days in windows_days]
+        entity_windows = windows_by_entity[prefix]
+        entity_columns = [f"{prefix}_events_{days}d" for days in entity_windows]
         if include_trends:
             entity_columns.extend(
                 [f"{prefix}_events_prev_7d", f"{prefix}_trend_7d"]
             )
         if include_recency:
             entity_columns.append(
-                f"{prefix}_days_since_last_listen_{max(windows_days)}d"
+                f"{prefix}_days_since_last_listen_{max(entity_windows)}d"
             )
         feature_projection_columns.extend(
             f"{prefix}_features.{column}" for column in entity_columns

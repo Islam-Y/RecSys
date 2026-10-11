@@ -9,7 +9,7 @@ from recsys_mvp.data import DataContractError, profile_data
 from recsys_mvp.features import WINDOWS_DAYS
 from recsys_mvp.train import run_baseline
 from recsys_mvp.window_search import run_window_search
-from recsys_mvp.yambda import prepare_yambda_candidates
+from recsys_mvp.yambda import prepare_cold_pair_candidates, prepare_yambda_candidates
 
 
 def _parse_windows_days(value: str) -> tuple[int, ...]:
@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=WINDOWS_DAYS,
         help="Comma-separated lookback windows in days; default: 1,7,30.",
     )
+    for prefix in ("user", "item", "pair"):
+        baseline.add_argument(
+            f"--{prefix}-windows-days",
+            type=_parse_windows_days,
+            help=f"Override lookback windows for {prefix} features.",
+        )
     baseline.add_argument(
         "--include-trends",
         action="store_true",
@@ -145,6 +151,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yambda.add_argument("--popular-pool-size", type=int, default=50000)
     yambda.add_argument("--seed", type=int, default=42)
+
+    cold_pair = commands.add_parser(
+        "cold-pair-control",
+        help="Keep only queries whose positive items lack prior Listen+ pair history.",
+    )
+    cold_pair.add_argument("input", type=Path)
+    cold_pair.add_argument("--history-input", type=Path, required=True)
+    cold_pair.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/processed/yambda_cold_pair_candidates.parquet"),
+    )
+    cold_pair.add_argument("--lookback-days", type=int, default=180)
     return parser
 
 
@@ -176,6 +195,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.popular_pool_size,
             )
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+            return 0
+
+        if args.command == "cold-pair-control":
+            report = prepare_cold_pair_candidates(
+                args.input,
+                args.history_input,
+                args.output,
+                args.lookback_days,
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
 
         if args.command == "search-windows":
@@ -210,6 +239,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             not args.validation_only,
             args.train_quantile,
             args.validation_quantile,
+            {
+                prefix: values
+                for prefix in ("user", "item", "pair")
+                if (values := getattr(args, f"{prefix}_windows_days")) is not None
+            },
         )
         print(json.dumps(metrics, indent=2, ensure_ascii=False, default=str))
         return 0
