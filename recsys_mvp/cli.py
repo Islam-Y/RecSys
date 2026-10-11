@@ -5,11 +5,18 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from recsys_mvp.auto_features import ENTITIES, SEARCH_WINDOWS_DAYS
 from recsys_mvp.data import DataContractError, profile_data
+from recsys_mvp.feature_search import run_feature_search
 from recsys_mvp.features import WINDOWS_DAYS
 from recsys_mvp.train import run_baseline
 from recsys_mvp.window_search import run_window_search
-from recsys_mvp.yambda import prepare_cold_pair_candidates, prepare_yambda_candidates
+from recsys_mvp.yambda import (
+    prepare_cold_pair_candidates,
+    prepare_unseen_pair_candidates,
+    prepare_yambda_candidates,
+    prepare_yambda_event_history,
+)
 
 
 def _parse_windows_days(value: str) -> tuple[int, ...]:
@@ -26,6 +33,31 @@ def _parse_windows_days(value: str) -> tuple[int, ...]:
     if len(set(windows)) != len(windows):
         raise argparse.ArgumentTypeError("Feature windows must not contain duplicates.")
     return tuple(sorted(windows))
+
+
+def _parse_entities(value: str) -> tuple[str, ...]:
+    entities = tuple(part.strip() for part in value.split(","))
+    if (
+        not entities
+        or len(set(entities)) != len(entities)
+        or set(entities) - set(ENTITIES)
+    ):
+        raise argparse.ArgumentTypeError("Use unique user,item,pair entity names.")
+    return entities
+
+
+def _parse_split_quantiles(value: str) -> tuple[float, float, float]:
+    try:
+        values = tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Use three increasing quantiles, such as 0.50,0.70,0.85."
+        ) from error
+    if len(values) != 3 or not 0 < values[0] < values[1] < values[2] < 1:
+        raise argparse.ArgumentTypeError(
+            "Use three increasing quantiles within 0-1."
+        )
+    return values
 
 
 def _add_column_options(parser: argparse.ArgumentParser, include_label: bool) -> None:
@@ -164,6 +196,51 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("data/processed/yambda_cold_pair_candidates.parquet"),
     )
     cold_pair.add_argument("--lookback-days", type=int, default=180)
+
+    events = commands.add_parser(
+        "prepare-events",
+        help="Normalize Yambda events for automatic temporal features.",
+    )
+    events.add_argument("input", type=Path)
+    events.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/processed/yambda_events.parquet"),
+    )
+
+    unseen_pair = commands.add_parser(
+        "unseen-pair-control",
+        help="Keep queries whose positive items have no prior interaction.",
+    )
+    unseen_pair.add_argument("input", type=Path)
+    unseen_pair.add_argument("--event-history-input", type=Path, required=True)
+    unseen_pair.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/processed/yambda_unseen_candidates.parquet"),
+    )
+
+    feature_search = commands.add_parser(
+        "search-features",
+        help="Generate and select temporal aggregate formulas against a manual control.",
+    )
+    feature_search.add_argument("input", type=Path)
+    feature_search.add_argument("--event-history-input", type=Path, required=True)
+    feature_search.add_argument(
+        "--output-dir", type=Path, default=Path("outputs/feature-search")
+    )
+    feature_search.add_argument(
+        "--entities", type=_parse_entities, default=("user", "item")
+    )
+    feature_search.add_argument(
+        "--windows-days", type=_parse_windows_days, default=SEARCH_WINDOWS_DAYS
+    )
+    feature_search.add_argument("--feature-budget", type=int, default=12)
+    feature_search.add_argument(
+        "--split-quantiles",
+        type=_parse_split_quantiles,
+        default=(0.50, 0.70, 0.85),
+    )
     return parser
 
 
@@ -205,6 +282,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.lookback_days,
             )
             print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "prepare-events":
+            report = prepare_yambda_event_history(args.input, args.output)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "unseen-pair-control":
+            report = prepare_unseen_pair_candidates(
+                args.input, args.event_history_input, args.output
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0
+
+        if args.command == "search-features":
+            report = run_feature_search(
+                args.input,
+                args.event_history_input,
+                args.output_dir,
+                args.entities,
+                args.windows_days,
+                args.feature_budget,
+                args.split_quantiles,
+            )
+            print(
+                json.dumps(
+                    {
+                        "manual_audit": report["manual"]["audit"]["metrics"],
+                        "automatic_audit": report["automatic"]["audit"]["metrics"],
+                        "popularity_audit": report["item_popularity_30d_audit"],
+                        "selected_features": report["automatic"]["chosen_selection"]["features"],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
 
         if args.command == "search-windows":

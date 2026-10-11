@@ -9,6 +9,132 @@ import duckdb
 from recsys_mvp.data import DataContractError, quote_sql_string
 
 
+def prepare_yambda_event_history(
+    input_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Normalize Yambda interactions for temporal feature generation."""
+    source = input_path.expanduser().resolve()
+    destination = output_path.expanduser().resolve()
+    if not source.is_file():
+        raise DataContractError(f"Input file does not exist: {source}")
+    if source == destination:
+        raise DataContractError("Event-history output must not overwrite the input.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect()
+    try:
+        connection.execute("SET preserve_insertion_order = false")
+        connection.execute(
+            f"""
+            COPY (
+                SELECT
+                    CAST(uid AS VARCHAR) AS user_id,
+                    CAST(item_id AS VARCHAR) AS item_id,
+                    make_timestamp(CAST(timestamp AS BIGINT) * 1000000) AS event_time,
+                    CASE
+                        WHEN event_type = 'listen' AND played_ratio_pct > 50
+                            THEN 'listen_plus'
+                        WHEN event_type = 'listen' AND played_ratio_pct <= 50
+                            THEN 'listen_short'
+                        ELSE event_type
+                    END AS event_kind,
+                    CAST(played_ratio_pct AS DOUBLE) AS played_ratio_pct
+                FROM read_parquet({quote_sql_string(str(source))})
+            ) TO {quote_sql_string(str(destination))}
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        counts = dict(
+            connection.execute(
+                f"""
+                SELECT event_kind, COUNT(*)
+                FROM read_parquet({quote_sql_string(str(destination))})
+                GROUP BY event_kind
+                """
+            ).fetchall()
+        )
+        report = {
+            "source": str(source),
+            "output": str(destination),
+            "event_counts": counts,
+            "time_rule": "source timestamps are seconds with arbitrary origin",
+        }
+        destination.with_suffix(destination.suffix + ".metadata.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return report
+    finally:
+        connection.close()
+
+
+def prepare_unseen_pair_candidates(
+    input_path: Path,
+    event_history_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Keep queries whose positive items have no prior interaction of any kind."""
+    source = input_path.expanduser().resolve()
+    history = event_history_path.expanduser().resolve()
+    destination = output_path.expanduser().resolve()
+    for path in (source, history):
+        if not path.is_file():
+            raise DataContractError(f"Input file does not exist: {path}")
+    if destination in {source, history}:
+        raise DataContractError("Unseen-pair output must not overwrite an input.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            f"""
+            CREATE TEMP TABLE seen_positive_queries AS
+            SELECT DISTINCT c.query_id
+            FROM read_parquet({quote_sql_string(str(source))}) AS c
+            JOIN read_parquet({quote_sql_string(str(history))}) AS h
+              ON c.user_id = h.user_id
+             AND c.item_id = h.item_id
+             AND h.event_time < c.timestamp
+            WHERE c.label = 1
+            """
+        )
+        excluded_queries = connection.execute(
+            "SELECT COUNT(*) FROM seen_positive_queries"
+        ).fetchone()[0]
+        connection.execute(
+            f"""
+            COPY (
+                SELECT c.*
+                FROM read_parquet({quote_sql_string(str(source))}) AS c
+                ANTI JOIN seen_positive_queries USING (query_id)
+            ) TO {quote_sql_string(str(destination))}
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+        rows, queries, positives = connection.execute(
+            f"""
+            SELECT COUNT(*), COUNT(DISTINCT query_id), SUM(label)
+            FROM read_parquet({quote_sql_string(str(destination))})
+            """
+        ).fetchone()
+        report = {
+            "source": str(source),
+            "event_history": str(history),
+            "output": str(destination),
+            "excluded_queries": excluded_queries,
+            "rows": rows,
+            "queries": queries,
+            "positives": positives,
+            "rule": "exclude query if any positive item had any prior interaction",
+        }
+        destination.with_suffix(destination.suffix + ".metadata.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return report
+    finally:
+        connection.close()
+
+
 def prepare_cold_pair_candidates(
     input_path: Path,
     history_input_path: Path,
