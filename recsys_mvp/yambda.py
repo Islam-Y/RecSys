@@ -220,12 +220,15 @@ def prepare_yambda_candidates(
     seed: int = 42,
     negative_strategy: str = "mixed",
     popular_pool_size: int = 50_000,
+    query_seed: int | None = None,
+    popular_pool_cutoff_seconds: int | None = None,
+    catalog_cutoff_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Prepare a small sampled next-listen ranking task from Yambda-50M.
 
-    Positive labels are Listen+ events. Negatives are sampled from the
-    available catalog using the selected strategy and must be unseen by the
-    user before each query. They are proxy negatives, not observed non-clicks.
+    Positive query timestamps use query_seed; negatives use seed. Negatives are
+    sampled from the available catalog and must be unseen by the user before
+    each query. They are proxy negatives, not observed non-clicks.
     """
     source_path = input_path.expanduser().resolve()
     if not source_path.is_file():
@@ -240,6 +243,7 @@ def prepare_yambda_candidates(
         )
     if popular_pool_size < 1:
         raise DataContractError("--popular-pool-size must be at least 1.")
+    query_seed = seed if query_seed is None else query_seed
 
     candidate_path = candidate_output.expanduser().resolve()
     history_path = history_output.expanduser().resolve()
@@ -310,7 +314,7 @@ def prepare_yambda_candidates(
                 CAST(user_id AS VARCHAR) || ':' || CAST(event_time_seconds AS VARCHAR) AS query_id
             FROM positive_history
             GROUP BY user_id, event_time_seconds
-            HAVING hash(user_id, event_time_seconds, {int(seed)}) % {int(query_sample_modulo)} = 0
+            HAVING hash(user_id, event_time_seconds, {int(query_seed)}) % {int(query_sample_modulo)} = 0
             """
         )
         query_count = connection.execute(
@@ -322,9 +326,14 @@ def prepare_yambda_candidates(
                 "--query-sample-modulo and try again."
             )
 
-        popularity_cutoff = connection.execute(
+        derived_popularity_cutoff = connection.execute(
             "SELECT quantile_disc(event_time_seconds, 0.20) FROM all_selected_queries"
         ).fetchone()[0]
+        popularity_cutoff = (
+            derived_popularity_cutoff
+            if popular_pool_cutoff_seconds is None
+            else popular_pool_cutoff_seconds
+        )
         connection.execute(
             f"""
             CREATE TEMP TABLE selected_queries AS
@@ -340,9 +349,18 @@ def prepare_yambda_candidates(
                 "Fewer than three candidate timestamps remain after the popularity-pool "
                 "warm-up. Lower --query-sample-modulo and retry."
             )
-        train_cutoff = connection.execute(
+        derived_train_cutoff = connection.execute(
             "SELECT quantile_disc(event_time_seconds, 0.70) FROM selected_queries"
         ).fetchone()[0]
+        train_cutoff = (
+            derived_train_cutoff
+            if catalog_cutoff_seconds is None
+            else catalog_cutoff_seconds
+        )
+        if train_cutoff <= popularity_cutoff:
+            raise DataContractError(
+                "--catalog-cutoff-seconds must be later than the popularity-pool cutoff."
+            )
         connection.execute(
             f"""
             CREATE TEMP TABLE item_catalog AS
@@ -564,12 +582,17 @@ def prepare_yambda_candidates(
                 "sampling": {
                     "query_hash_modulo": query_sample_modulo,
                     "seed": seed,
+                    "negative_sampling_seed": seed,
+                    "query_seed": query_seed,
+                    "popular_pool_cutoff_seconds_requested": popular_pool_cutoff_seconds,
+                    "catalog_cutoff_seconds_requested": catalog_cutoff_seconds,
                     "requested_negatives_per_query": negatives_per_query,
                     "proposal_multiplier": 8,
                     "negative_strategy": negative_strategy,
                     "popular_pool_size_requested": popular_pool_size,
                     "popular_pool_size_actual": popular_catalog_size,
                     "popular_pool_cutoff_event_time_seconds": popularity_cutoff,
+                    "catalog_cutoff_event_time_seconds": train_cutoff,
                     "popular_pool_warmup_share": 0.20,
                     "warmup_query_timestamps": warmup_query_count,
                     "query_timestamps_sampled": query_count,

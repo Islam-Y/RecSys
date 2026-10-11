@@ -10,6 +10,7 @@ from recsys_mvp.data import DataContractError, profile_data
 from recsys_mvp.feature_search import run_feature_search
 from recsys_mvp.features import WINDOWS_DAYS
 from recsys_mvp.robust_search import run_robust_feature_search
+from recsys_mvp.sampling_sensitivity import run_sampling_sensitivity
 from recsys_mvp.train import run_baseline
 from recsys_mvp.window_search import run_window_search
 from recsys_mvp.yambda import (
@@ -59,6 +60,13 @@ def _parse_split_quantiles(value: str) -> tuple[float, float, float]:
             "Use three increasing quantiles within 0-1."
         )
     return values
+
+
+def _parse_named_path(value: str) -> tuple[str, Path]:
+    label, separator, raw_path = value.partition("=")
+    if not separator or not label.strip() or not raw_path.strip():
+        raise argparse.ArgumentTypeError("Use LABEL=PATH.")
+    return label.strip(), Path(raw_path.strip())
 
 
 def _add_column_options(parser: argparse.ArgumentParser, include_label: bool) -> None:
@@ -184,6 +192,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yambda.add_argument("--popular-pool-size", type=int, default=50000)
     yambda.add_argument("--seed", type=int, default=42)
+    yambda.add_argument(
+        "--query-seed",
+        type=int,
+        help="Seed for selecting query timestamps; defaults to --seed.",
+    )
+    yambda.add_argument(
+        "--popular-pool-cutoff-seconds",
+        type=int,
+        help="Freeze the event-time cutoff used to build the popularity negative pool.",
+    )
+    yambda.add_argument(
+        "--catalog-cutoff-seconds",
+        type=int,
+        help="Freeze the event-time cutoff for the item catalog.",
+    )
 
     cold_pair = commands.add_parser(
         "cold-pair-control",
@@ -260,6 +283,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--windows-days", type=_parse_windows_days, default=SEARCH_WINDOWS_DAYS
     )
     robust_search.add_argument("--feature-budget", type=int, default=12)
+
+    sampling_check = commands.add_parser(
+        "sampling-sensitivity",
+        help="Compare negative pools on fixed queries and metrics on disjoint query cohorts.",
+    )
+    sampling_check.add_argument(
+        "--negative-variant",
+        type=_parse_named_path,
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+    )
+    sampling_check.add_argument(
+        "--query-variant",
+        type=_parse_named_path,
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+    )
+    sampling_check.add_argument(
+        "--exclude-query-input",
+        type=Path,
+        action="append",
+        default=[],
+        help="Earlier discovery or training candidate sets whose query IDs must be excluded.",
+    )
+    sampling_check.add_argument("--feature-summary", type=Path, required=True)
+    sampling_check.add_argument("--event-history-input", type=Path, required=True)
+    sampling_check.add_argument(
+        "--output-dir", type=Path, default=Path("outputs/sampling-sensitivity")
+    )
     return parser
 
 
@@ -289,6 +343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.seed,
                 args.negative_strategy,
                 args.popular_pool_size,
+                args.query_seed,
+                args.popular_pool_cutoff_seconds,
+                args.catalog_cutoff_seconds,
             )
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
             return 0
@@ -359,6 +416,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "automatic_audit": holdout["automatic"]["audit"]["metrics"],
                         "paired_audit_comparison": holdout[
                             "paired_audit_comparison"
+                        ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        if args.command == "sampling-sensitivity":
+            report = run_sampling_sensitivity(
+                tuple(args.negative_variant),
+                tuple(args.query_variant),
+                tuple(args.exclude_query_input),
+                args.feature_summary,
+                args.event_history_input,
+                args.output_dir,
+            )
+            print(
+                json.dumps(
+                    {
+                        "selected_features": report["protocol"]["selected_features"],
+                        "negative_pool_comparisons": report["negative_sampling"][
+                            "paired_comparisons_to_first_pool"
+                        ],
+                        "query_cohort_metrics": report["query_sampling"][
+                            "metrics_by_disjoint_cohort"
                         ],
                     },
                     indent=2,
