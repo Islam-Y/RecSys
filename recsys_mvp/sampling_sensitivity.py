@@ -12,6 +12,7 @@ import pandas as pd
 
 from recsys_mvp.auto_features import SEARCH_WINDOWS_DAYS, generate_feature_specs
 from recsys_mvp.data import DataContractError, quote_sql_string
+from recsys_mvp.evaluation import evaluate_predictions
 from recsys_mvp.feature_search import (
     CATEGORICAL_FEATURES,
     MANUAL_FEATURE_NAMES,
@@ -337,6 +338,196 @@ def _serialize_sample(sample: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in sample.items() if key != "audit_query_ndcg"}
 
 
+def _evaluate_frozen_model(
+    model,
+    rows: pd.DataFrame,
+    feature_names: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[tuple[str, str], float]]:
+    scores = model.predict_proba(
+        rows[[*CATEGORICAL_FEATURES, *feature_names]]
+    )[:, 1]
+    metrics = evaluate_predictions(
+        rows, pd.Series(scores, index=rows.index)
+    )
+    return metrics, _query_ndcg_values(rows, scores)
+
+
+def _fit_frozen_audit_sensitivity(
+    variants: tuple[tuple[str, Path], ...],
+    event_history_path: Path,
+    specs,
+    selected_features: tuple[str, ...],
+    training_negative_seed: int,
+) -> dict[str, Any]:
+    """Train on the first negative pool, then vary audit pools only."""
+    matrices = []
+    common_cutoffs = None
+    for label, candidate_path in variants:
+        rows, cutoffs, feature_seconds = _build_matrix(
+            candidate_path,
+            event_history_path,
+            specs,
+            (0.50, 0.70, 0.85),
+            common_cutoffs[2] if common_cutoffs is not None else None,
+        )
+        if common_cutoffs is None:
+            common_cutoffs = cutoffs
+        elif cutoffs != common_cutoffs:
+            raise DataContractError(
+                f"Temporal split changed for frozen audit variant {label}."
+            )
+        for column in CATEGORICAL_FEATURES:
+            rows[column] = rows[column].fillna("__MISSING__").astype(str)
+        rows = rows.sort_values(
+            ["event_time", "query_id", "label", "item_id"],
+            ascending=[True, True, False, True],
+            kind="stable",
+        ).reset_index(drop=True)
+        train_mask, selection_mask, audit_mask = _masks(rows, cutoffs)
+        matrices.append(
+            {
+                "label": label,
+                "input": str(candidate_path),
+                "rows": rows,
+                "train_mask": train_mask,
+                "selection_mask": selection_mask,
+                "audit_mask": audit_mask,
+                "feature_generation_seconds": feature_seconds,
+            }
+        )
+
+    reference = matrices[0]
+    reference_rows = reference["rows"]
+    train_mask = reference["train_mask"]
+    selection_mask = reference["selection_mask"]
+    audit_mask = reference["audit_mask"]
+    train_and_selection = train_mask | selection_mask
+
+    _, manual_selection = _fit_and_score(
+        reference_rows, MANUAL_FEATURE_NAMES, train_mask, selection_mask
+    )
+    _, automatic_selection = _fit_and_score(
+        reference_rows, selected_features, train_mask, selection_mask
+    )
+    manual_model, manual_reference = _fit_and_score(
+        reference_rows,
+        MANUAL_FEATURE_NAMES,
+        train_and_selection,
+        audit_mask,
+        manual_selection["iterations"],
+    )
+    automatic_model, automatic_reference = _fit_and_score(
+        reference_rows,
+        selected_features,
+        train_and_selection,
+        audit_mask,
+        automatic_selection["iterations"],
+    )
+    models = {
+        "manual": {
+            "model": manual_model,
+            "features": MANUAL_FEATURE_NAMES,
+            "selection": manual_selection,
+            "reference_audit_metrics": manual_reference["metrics"],
+            "reference_query_ndcg": None,
+        },
+        "automatic": {
+            "model": automatic_model,
+            "features": selected_features,
+            "selection": automatic_selection,
+            "reference_audit_metrics": automatic_reference["metrics"],
+            "reference_query_ndcg": None,
+        },
+    }
+
+    for model_data in models.values():
+        reference_metrics, reference_ndcg = _evaluate_frozen_model(
+            model_data["model"],
+            reference_rows.loc[audit_mask],
+            model_data["features"],
+        )
+        if reference_metrics["ndcg@3"] != model_data["reference_audit_metrics"]["ndcg@3"]:
+            raise DataContractError("Frozen reference audit metrics do not match.")
+        model_data["reference_query_ndcg"] = reference_ndcg
+
+    audit_query_ids = set(
+        reference_rows.loc[audit_mask, "query_id"].astype(str).unique()
+    )
+    audit_positive_signature = _audit_positive_signature(
+        reference_rows.loc[audit_mask]
+    )
+    audit_results = []
+    for matrix in matrices:
+        rows = matrix["rows"]
+        audit_rows = rows.loc[matrix["audit_mask"]]
+        current_query_ids = set(audit_rows["query_id"].astype(str).unique())
+        if current_query_ids != audit_query_ids:
+            raise DataContractError(
+                f"Frozen audit variant {matrix['label']} changed audit query IDs."
+            )
+        if _audit_positive_signature(audit_rows) != audit_positive_signature:
+            raise DataContractError(
+                f"Frozen audit variant {matrix['label']} changed positive candidates."
+            )
+
+        metrics = {}
+        paired_to_reference = {}
+        for model_name, model_data in models.items():
+            current_metrics, current_ndcg = _evaluate_frozen_model(
+                model_data["model"], audit_rows, model_data["features"]
+            )
+            metrics[model_name] = current_metrics
+            paired_to_reference[model_name] = (
+                None
+                if matrix["label"] == reference["label"]
+                else _paired_bootstrap(
+                    model_data["reference_query_ndcg"],
+                    current_ndcg,
+                    metric_name="audit_pool_minus_reference_ndcg@3",
+                )
+            )
+        audit_results.append(
+            {
+                "label": matrix["label"],
+                "input": matrix["input"],
+                "audit_query_count": len(current_query_ids),
+                "audit_rows": len(audit_rows),
+                "manual_metrics": metrics["manual"],
+                "automatic_metrics": metrics["automatic"],
+                "paired_audit_pool_change_vs_reference": paired_to_reference,
+                "feature_generation_seconds": matrix[
+                    "feature_generation_seconds"
+                ],
+            }
+        )
+
+    return {
+        "training_variant": reference["label"],
+        "training_input": reference["input"],
+        "training_negative_seed": training_negative_seed,
+        "train_rows": int(train_mask.sum()),
+        "selection_rows": int(selection_mask.sum()),
+        "training_cutoffs": [str(value) for value in common_cutoffs],
+        "manual_training_iterations": manual_selection["iterations"],
+        "automatic_training_iterations": automatic_selection["iterations"],
+        "frozen_models": True,
+        "same_audit_query_ids": True,
+        "same_audit_positive_candidates": True,
+        "audit_samples": audit_results,
+    }
+
+
+def _audit_positive_signature(rows: pd.DataFrame) -> tuple[tuple[Any, ...], ...]:
+    positive_rows = rows.loc[
+        rows["label"].astype(int) == 1,
+        ["query_id", "user_id", "item_id", "event_time"],
+    ].drop_duplicates()
+    positive_rows = positive_rows.sort_values(
+        ["query_id", "user_id", "item_id", "event_time"], kind="stable"
+    )
+    return tuple(positive_rows.itertuples(index=False, name=None))
+
+
 def run_sampling_sensitivity(
     negative_variants: tuple[tuple[str, Path], ...],
     query_variants: tuple[tuple[str, Path], ...],
@@ -448,6 +639,13 @@ def run_sampling_sensitivity(
         _fit_sample(label, path, history_path, specs, selected_features)
         for label, path in filtered_negative_paths
     ]
+    frozen_audit_sensitivity = _fit_frozen_audit_sensitivity(
+        tuple(filtered_negative_paths),
+        history_path,
+        specs,
+        selected_features,
+        negative_group["variants"][0]["sampling"]["negative_sampling_seed"],
+    )
     query_samples = [
         _fit_sample(label, path, history_path, specs, selected_features)
         for label, path in filtered_query_paths
@@ -521,6 +719,7 @@ def run_sampling_sensitivity(
             },
             "samples": [_serialize_sample(sample) for sample in negative_samples],
             "paired_comparisons_to_first_pool": negative_comparisons,
+            "fixed_training_audit_sensitivity": frozen_audit_sensitivity,
         },
         "query_sampling": {
             "sampling_config": query_group,

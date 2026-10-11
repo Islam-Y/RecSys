@@ -440,6 +440,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "negative_pool_comparisons": report["negative_sampling"][
                             "paired_comparisons_to_first_pool"
                         ],
+                        "fixed_training_audit_sensitivity": report[
+                            "negative_sampling"
+                        ]["fixed_training_audit_sensitivity"],
                         "query_cohort_metrics": report["query_sampling"][
                             "metrics_by_disjoint_cohort"
                         ],
