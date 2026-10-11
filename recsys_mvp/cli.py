@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Sequence
 
 from recsys_mvp.data import DataContractError, profile_data
-from recsys_mvp.yambda import prepare_yambda_candidates
-from recsys_mvp.train import run_baseline
 from recsys_mvp.features import WINDOWS_DAYS
+from recsys_mvp.train import run_baseline
+from recsys_mvp.window_search import run_window_search
+from recsys_mvp.yambda import prepare_yambda_candidates
 
 
 def _parse_windows_days(value: str) -> tuple[int, ...]:
@@ -79,7 +80,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not calculate or write test metrics; use validation for comparison.",
     )
+    baseline.add_argument(
+        "--train-quantile",
+        type=float,
+        default=0.70,
+        help="Train cutoff as a global timestamp quantile; default: 0.70.",
+    )
+    baseline.add_argument(
+        "--validation-quantile",
+        type=float,
+        default=0.85,
+        help="Validation cutoff as a global timestamp quantile; default: 0.85.",
+    )
     _add_column_options(baseline, include_label=True)
+
+    search = commands.add_parser(
+        "search-windows",
+        help="Compare temporal window groups on validation under window-count budgets.",
+    )
+    search.add_argument("input", type=Path)
+    search.add_argument("--output-dir", type=Path, default=Path("outputs/window-search"))
+    search.add_argument("--history-input", type=Path)
+    search.add_argument(
+        "--base-windows",
+        type=_parse_windows_days,
+        default=WINDOWS_DAYS,
+        help="Starting windows; default: 1,7,30.",
+    )
+    search.add_argument(
+        "--candidate-windows",
+        type=_parse_windows_days,
+        default=(3, 14, 60, 90),
+        help="Windows to try adding; default: 3,14,60,90.",
+    )
+    search.add_argument(
+        "--max-windows",
+        type=int,
+        help="Maximum number of windows to evaluate; default: all candidates.",
+    )
+    _add_column_options(search, include_label=True)
 
     yambda = commands.add_parser(
         "prepare-yambda",
@@ -139,6 +178,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
             return 0
 
+        if args.command == "search-windows":
+            report = run_window_search(
+                args.input,
+                args.output_dir,
+                args.history_input,
+                args.base_windows,
+                args.candidate_windows,
+                args.user_column,
+                args.item_column,
+                args.timestamp_column,
+                args.label_column,
+                args.query_column,
+                max_windows=args.max_windows,
+            )
+            print(json.dumps(report["best_by_budget"], indent=2, ensure_ascii=False))
+            return 0
+
         metrics = run_baseline(
             args.input,
             args.output_dir,
@@ -152,6 +208,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.include_trends,
             args.include_recency,
             not args.validation_only,
+            args.train_quantile,
+            args.validation_quantile,
         )
         print(json.dumps(metrics, indent=2, ensure_ascii=False, default=str))
         return 0

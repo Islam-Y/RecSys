@@ -52,7 +52,13 @@ def run_baseline(
     include_trends: bool = False,
     include_recency: bool = False,
     evaluate_test: bool = True,
+    train_quantile: float = 0.70,
+    validation_quantile: float = 0.85,
 ) -> dict[str, Any]:
+    if not 0 < train_quantile < validation_quantile < 1:
+        raise DataContractError(
+            "Split quantiles must satisfy 0 < train < validation < 1."
+        )
     run_started = time.perf_counter()
     connection = duckdb.connect()
     try:
@@ -68,11 +74,11 @@ def run_baseline(
         )
 
         total_rows, train_cutoff, validation_cutoff = connection.execute(
-            """
+            f"""
             SELECT
                 COUNT(*),
-                quantile_disc(event_time, 0.70),
-                quantile_disc(event_time, 0.85)
+                quantile_disc(event_time, {train_quantile}),
+                quantile_disc(event_time, {validation_quantile})
             FROM examples
             """
         ).fetchone()
@@ -188,13 +194,27 @@ def run_baseline(
 
     metrics: dict[str, Any] = {
         "input": str(input_path.expanduser().resolve()),
+        "source_columns": {
+            "user": user_column,
+            "item": item_column,
+            "timestamp": timestamp_column,
+            "label": label_column,
+            "query": query_column,
+        },
         "history_input": (
             str(history_input_path.expanduser().resolve())
             if history_input_path is not None
             else None
         ),
         "split": {
-            "strategy": "chronological global 70/15/15 by timestamp quantiles",
+            "strategy": (
+                "chronological global "
+                f"{train_quantile:.0%}/"
+                f"{validation_quantile - train_quantile:.0%}/"
+                f"{1 - validation_quantile:.0%} by timestamp quantiles"
+            ),
+            "train_quantile": train_quantile,
+            "validation_quantile": validation_quantile,
             "train_cutoff_inclusive": train_cutoff,
             "validation_cutoff_inclusive": validation_cutoff,
             "rows": {
