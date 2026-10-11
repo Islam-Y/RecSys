@@ -9,6 +9,7 @@ from recsys_mvp.auto_features import ENTITIES, SEARCH_WINDOWS_DAYS
 from recsys_mvp.data import DataContractError, profile_data
 from recsys_mvp.feature_search import run_feature_search
 from recsys_mvp.features import WINDOWS_DAYS
+from recsys_mvp.robust_search import run_robust_feature_search
 from recsys_mvp.train import run_baseline
 from recsys_mvp.window_search import run_window_search
 from recsys_mvp.yambda import (
@@ -241,6 +242,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_split_quantiles,
         default=(0.50, 0.70, 0.85),
     )
+
+    robust_search = commands.add_parser(
+        "robust-search-features",
+        help="Select temporal formulas across discovery folds; evaluate on a holdout sample.",
+    )
+    robust_search.add_argument("discovery_inputs", type=Path, nargs="+")
+    robust_search.add_argument("--holdout-input", type=Path, required=True)
+    robust_search.add_argument("--event-history-input", type=Path, required=True)
+    robust_search.add_argument(
+        "--output-dir", type=Path, default=Path("outputs/robust-feature-search")
+    )
+    robust_search.add_argument(
+        "--entities", type=_parse_entities, default=("user", "item")
+    )
+    robust_search.add_argument(
+        "--windows-days", type=_parse_windows_days, default=SEARCH_WINDOWS_DAYS
+    )
+    robust_search.add_argument("--feature-budget", type=int, default=12)
     return parser
 
 
@@ -313,6 +332,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "automatic_audit": report["automatic"]["audit"]["metrics"],
                         "popularity_audit": report["item_popularity_30d_audit"],
                         "selected_features": report["automatic"]["chosen_selection"]["features"],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        if args.command == "robust-search-features":
+            report = run_robust_feature_search(
+                tuple(args.discovery_inputs),
+                args.holdout_input,
+                args.event_history_input,
+                args.output_dir,
+                args.entities,
+                args.windows_days,
+                args.feature_budget,
+            )
+            holdout = report["holdout"]
+            print(
+                json.dumps(
+                    {
+                        "chosen_feature_budget": report["chosen_feature_budget"],
+                        "selected_features": report["selected_features"],
+                        "manual_audit": holdout["manual"]["audit"]["metrics"],
+                        "automatic_audit": holdout["automatic"]["audit"]["metrics"],
+                        "paired_audit_comparison": holdout[
+                            "paired_audit_comparison"
+                        ],
                     },
                     indent=2,
                     ensure_ascii=False,
