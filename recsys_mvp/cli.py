@@ -8,6 +8,23 @@ from typing import Sequence
 from recsys_mvp.data import DataContractError, profile_data
 from recsys_mvp.yambda import prepare_yambda_candidates
 from recsys_mvp.train import run_baseline
+from recsys_mvp.features import WINDOWS_DAYS
+
+
+def _parse_windows_days(value: str) -> tuple[int, ...]:
+    try:
+        windows = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "Use comma-separated positive whole days, such as 1,7,30."
+        ) from error
+    if not windows or any(days < 1 for days in windows):
+        raise argparse.ArgumentTypeError(
+            "Feature windows must be positive whole days."
+        )
+    if len(set(windows)) != len(windows):
+        raise argparse.ArgumentTypeError("Feature windows must not contain duplicates.")
+    return tuple(sorted(windows))
 
 
 def _add_column_options(parser: argparse.ArgumentParser, include_label: bool) -> None:
@@ -40,6 +57,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--history-input",
         type=Path,
         help="Optional full positive-event history Parquet with user_id, item_id, event_time.",
+    )
+    baseline.add_argument(
+        "--windows-days",
+        type=_parse_windows_days,
+        default=WINDOWS_DAYS,
+        help="Comma-separated lookback windows in days; default: 1,7,30.",
+    )
+    baseline.add_argument(
+        "--include-trends",
+        action="store_true",
+        help="Add previous-7-day counts and normalized 7-day activity changes.",
+    )
+    baseline.add_argument(
+        "--include-recency",
+        action="store_true",
+        help="Add days since the last positive event within the largest window.",
+    )
+    baseline.add_argument(
+        "--validation-only",
+        action="store_true",
+        help="Do not calculate or write test metrics; use validation for comparison.",
     )
     _add_column_options(baseline, include_label=True)
 
@@ -110,6 +148,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.label_column,
             args.query_column,
             args.history_input,
+            args.windows_days,
+            args.include_trends,
+            args.include_recency,
+            not args.validation_only,
         )
         print(json.dumps(metrics, indent=2, ensure_ascii=False, default=str))
         return 0

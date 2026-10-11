@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import resource
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +17,7 @@ from recsys_mvp.data import (
     register_source,
 )
 from recsys_mvp.evaluation import evaluate_predictions, evaluate_ranking_scores
-from recsys_mvp.features import build_feature_table
+from recsys_mvp.features import WINDOWS_DAYS, build_feature_table
 
 
 def _json_default(value: Any) -> str:
@@ -30,6 +33,12 @@ def _metrics_for_split(frame: pd.DataFrame, scores: pd.Series) -> dict[str, Any]
     return result
 
 
+def _peak_process_memory_mb() -> float:
+    peak_value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return round(peak_value / divisor, 1)
+
+
 def run_baseline(
     input_path: Path,
     output_dir: Path,
@@ -39,7 +48,12 @@ def run_baseline(
     label_column: str = "label",
     query_column: str = "query_id",
     history_input_path: Path | None = None,
+    windows_days: tuple[int, ...] = WINDOWS_DAYS,
+    include_trends: bool = False,
+    include_recency: bool = False,
+    evaluate_test: bool = True,
 ) -> dict[str, Any]:
+    run_started = time.perf_counter()
     connection = duckdb.connect()
     try:
         columns = register_source(connection, input_path)
@@ -52,7 +66,6 @@ def run_baseline(
             label_column,
             query_column,
         )
-        build_feature_table(connection, history_input_path)
 
         total_rows, train_cutoff, validation_cutoff = connection.execute(
             """
@@ -60,7 +73,7 @@ def run_baseline(
                 COUNT(*),
                 quantile_disc(event_time, 0.70),
                 quantile_disc(event_time, 0.85)
-            FROM model_data
+            FROM examples
             """
         ).fetchone()
         if total_rows < 3 or train_cutoff is None or validation_cutoff is None:
@@ -72,7 +85,7 @@ def run_baseline(
                 COUNT(*) FILTER (WHERE event_time <= ?),
                 COUNT(*) FILTER (WHERE event_time > ? AND event_time <= ?),
                 COUNT(*) FILTER (WHERE event_time > ?)
-            FROM model_data
+            FROM examples
             """,
             [train_cutoff, train_cutoff, validation_cutoff, validation_cutoff],
         ).fetchone()
@@ -82,6 +95,33 @@ def run_baseline(
                 "when many rows share the same timestamp; use coarser date-based "
                 "cutoffs after inspecting the data."
             )
+
+        if not evaluate_test:
+            connection.execute(
+                """
+                CREATE TEMP TABLE evaluation_examples AS
+                SELECT * FROM examples
+                WHERE event_time <= ?
+                """,
+                [validation_cutoff],
+            )
+            connection.execute("DROP VIEW examples")
+            connection.execute(
+                """
+                CREATE TEMP VIEW examples AS
+                SELECT * FROM evaluation_examples
+                """
+            )
+
+        feature_started = time.perf_counter()
+        build_feature_table(
+            connection,
+            history_input_path,
+            windows_days,
+            include_trends,
+            include_recency,
+        )
+        feature_generation_seconds = time.perf_counter() - feature_started
 
         all_rows = connection.execute("SELECT * FROM model_data ORDER BY row_id").fetchdf()
     finally:
@@ -99,7 +139,14 @@ def run_baseline(
         column
         for column in all_rows.columns
         if column
-        not in {"row_id", "query_id", "event_time", "label", "split"}
+        not in {
+            "row_id",
+            "query_id",
+            "event_time",
+            "label",
+            "split",
+            "item_popularity_30d",
+        }
     ]
     categorical_columns = ["user_id", "item_id"]
     for column in categorical_columns:
@@ -120,6 +167,7 @@ def run_baseline(
         verbose=False,
         allow_writing_files=False,
     )
+    training_started = time.perf_counter()
     model.fit(
         train_rows[feature_columns],
         train_rows["label"].astype(int),
@@ -131,6 +179,7 @@ def run_baseline(
         early_stopping_rounds=50,
         use_best_model=True,
     )
+    training_seconds = time.perf_counter() - training_started
 
     output_path = output_dir.expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -163,6 +212,11 @@ def run_baseline(
             ),
         },
         "features": feature_columns,
+        "feature_config": {
+            "windows_days": list(sorted(set(windows_days))),
+            "include_7d_trend_features": include_trends,
+            "include_days_since_last_listen_features": include_recency,
+        },
         "categorical_features": categorical_columns,
         "model": {
             "name": "CatBoostClassifier",
@@ -178,11 +232,17 @@ def run_baseline(
         "model_file": str(model_path),
     }
 
-    for split_name, rows in (
+    splits_to_evaluate = [
         ("train", train_rows),
         ("validation", validation_rows),
-        ("test", all_rows.loc[all_rows["split"] == "test"]),
-    ):
+    ]
+    if evaluate_test:
+        splits_to_evaluate.append(
+            ("test", all_rows.loc[all_rows["split"] == "test"])
+        )
+
+    scoring_started = time.perf_counter()
+    for split_name, rows in splits_to_evaluate:
         probabilities = model.predict_proba(rows[feature_columns])[:, 1]
         metrics["metrics"][split_name] = _metrics_for_split(
             rows,
@@ -192,10 +252,22 @@ def run_baseline(
             evaluate_ranking_scores(
                 rows,
                 rows["label"].astype(int),
-                rows["item_events_30d"].astype(float),
+                rows["item_popularity_30d"].astype(float),
                 k=3,
             )
         )
+
+    metrics["experiment"] = {
+        "test_metrics_evaluated": evaluate_test,
+        "validation_is_used_for_early_stopping": True,
+    }
+    metrics["runtime"] = {
+        "feature_generation_seconds": round(feature_generation_seconds, 3),
+        "training_seconds": round(training_seconds, 3),
+        "scoring_seconds": round(time.perf_counter() - scoring_started, 3),
+        "end_to_end_seconds": round(time.perf_counter() - run_started, 3),
+        "peak_process_memory_mb": _peak_process_memory_mb(),
+    }
 
     metrics_path = output_path / "metrics.json"
     metrics_path.write_text(
