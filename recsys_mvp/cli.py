@@ -433,6 +433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.event_history_input,
                 args.output_dir,
             )
+            matrix = report["negative_sampling"]["train_audit_matrix"]
             print(
                 json.dumps(
                     {
@@ -440,9 +441,82 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "negative_pool_comparisons": report["negative_sampling"][
                             "paired_comparisons_to_first_pool"
                         ],
-                        "fixed_training_audit_sensitivity": report[
-                            "negative_sampling"
-                        ]["fixed_training_audit_sensitivity"],
+                        "train_audit_matrix": {
+                            "audit_query_count": matrix["audit_query_count"],
+                            "same_audit_query_ids": matrix["same_audit_query_ids"],
+                            "same_audit_positive_candidates": matrix[
+                                "same_audit_positive_candidates"
+                            ],
+                            "cells": [
+                                {
+                                    "train_variant": cell["train_variant"],
+                                    "audit_variant": cell["audit_variant"],
+                                    "manual_ndcg@3": cell["manual_metrics"]["ndcg@3"],
+                                    "manual_recall@3": cell["manual_metrics"]["recall@3"],
+                                    "automatic_ndcg@3": cell["automatic_metrics"][
+                                        "ndcg@3"
+                                    ],
+                                    "automatic_recall@3": cell["automatic_metrics"][
+                                        "recall@3"
+                                    ],
+                                }
+                                for cell in matrix["cells"]
+                            ],
+                            "training_seed_effects": [
+                                {
+                                    "fixed_audit_variant": effect[
+                                        "fixed_audit_variant"
+                                    ],
+                                    "comparison_training_variant": effect[
+                                        "comparison_training_variant"
+                                    ],
+                                    "manual_ndcg_change": effect["paired_metrics"][
+                                        "manual"
+                                    ]["ndcg@3"]["training_pool_change_ndcg@3"],
+                                    "manual_interval": effect["paired_metrics"][
+                                        "manual"
+                                    ]["ndcg@3"]["bootstrap_95_percent_interval"],
+                                    "automatic_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["automatic"]["ndcg@3"][
+                                        "training_pool_change_ndcg@3"
+                                    ],
+                                    "automatic_interval": effect[
+                                        "paired_metrics"
+                                    ]["automatic"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                }
+                                for effect in matrix["training_seed_effects"]
+                            ],
+                            "audit_seed_effects": [
+                                {
+                                    "fixed_training_variant": effect[
+                                        "fixed_training_variant"
+                                    ],
+                                    "comparison_audit_variant": effect[
+                                        "comparison_audit_variant"
+                                    ],
+                                    "manual_ndcg_change": effect["paired_metrics"][
+                                        "manual"
+                                    ]["ndcg@3"]["audit_pool_change_ndcg@3"],
+                                    "manual_interval": effect["paired_metrics"][
+                                        "manual"
+                                    ]["ndcg@3"]["bootstrap_95_percent_interval"],
+                                    "automatic_ndcg_change": effect[
+                                        "paired_metrics"
+                                    ]["automatic"]["ndcg@3"][
+                                        "audit_pool_change_ndcg@3"
+                                    ],
+                                    "automatic_interval": effect[
+                                        "paired_metrics"
+                                    ]["automatic"]["ndcg@3"][
+                                        "bootstrap_95_percent_interval"
+                                    ],
+                                }
+                                for effect in matrix["audit_seed_effects"]
+                            ],
+                        },
                         "query_cohort_metrics": report["query_sampling"][
                             "metrics_by_disjoint_cohort"
                         ],

@@ -168,6 +168,22 @@ def _query_ndcg_values(frame: pd.DataFrame, scores: np.ndarray, k: int = 3):
     return values
 
 
+def _query_recall_values(frame: pd.DataFrame, scores: np.ndarray, k: int = 3):
+    labels = frame["label"].astype(int).to_numpy()
+    groups = frame.groupby(["user_id", "query_id"], sort=False).indices
+    values: dict[tuple[str, str], float] = {}
+    for key, positions in groups.items():
+        query_labels = labels[positions]
+        positives = int(query_labels.sum())
+        if len(positions) < 2 or positives == 0:
+            continue
+        order = np.argsort(-scores[positions], kind="stable")[:k]
+        values[(str(key[0]), str(key[1]))] = float(
+            query_labels[order].sum() / positives
+        )
+    return values
+
+
 def _paired_bootstrap(
     reference: dict[tuple[str, str], float],
     comparison: dict[tuple[str, str], float],
@@ -338,28 +354,35 @@ def _serialize_sample(sample: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in sample.items() if key != "audit_query_ndcg"}
 
 
-def _evaluate_frozen_model(
+def _evaluate_model(
     model,
     rows: pd.DataFrame,
     feature_names: tuple[str, ...],
-) -> tuple[dict[str, Any], dict[tuple[str, str], float]]:
+) -> tuple[
+    dict[str, Any],
+    dict[tuple[str, str], float],
+    dict[tuple[str, str], float],
+]:
     scores = model.predict_proba(
         rows[[*CATEGORICAL_FEATURES, *feature_names]]
     )[:, 1]
     metrics = evaluate_predictions(
         rows, pd.Series(scores, index=rows.index)
     )
-    return metrics, _query_ndcg_values(rows, scores)
+    return (
+        metrics,
+        _query_ndcg_values(rows, scores),
+        _query_recall_values(rows, scores),
+    )
 
 
-def _fit_frozen_audit_sensitivity(
+def _fit_train_audit_matrix(
     variants: tuple[tuple[str, Path], ...],
     event_history_path: Path,
     specs,
     selected_features: tuple[str, ...],
-    training_negative_seed: int,
 ) -> dict[str, Any]:
-    """Train on the first negative pool, then vary audit pools only."""
+    """Fit on each negative pool and score every model on every audit pool."""
     matrices = []
     common_cutoffs = None
     for label, candidate_path in variants:
@@ -374,7 +397,7 @@ def _fit_frozen_audit_sensitivity(
             common_cutoffs = cutoffs
         elif cutoffs != common_cutoffs:
             raise DataContractError(
-                f"Temporal split changed for frozen audit variant {label}."
+                f"Temporal split changed for train/audit variant {label}."
             )
         for column in CATEGORICAL_FEATURES:
             rows[column] = rows[column].fillna("__MISSING__").astype(str)
@@ -397,123 +420,278 @@ def _fit_frozen_audit_sensitivity(
         )
 
     reference = matrices[0]
-    reference_rows = reference["rows"]
-    train_mask = reference["train_mask"]
-    selection_mask = reference["selection_mask"]
-    audit_mask = reference["audit_mask"]
-    train_and_selection = train_mask | selection_mask
+    reference_train_rows = int(reference["train_mask"].sum())
+    reference_selection_rows = int(reference["selection_mask"].sum())
+    reference_audit_rows = reference["rows"].loc[reference["audit_mask"]]
+    reference_query_ids = set(reference_audit_rows["query_id"].astype(str).unique())
+    reference_positive_signature = _audit_positive_signature(reference_audit_rows)
+    reference_audit_row_count = len(reference_audit_rows)
+    for matrix in matrices[1:]:
+        if int(matrix["train_mask"].sum()) != reference_train_rows or int(
+            matrix["selection_mask"].sum()
+        ) != reference_selection_rows:
+            raise DataContractError(
+                f"Train/audit variant {matrix['label']} changed train or selection row counts."
+            )
+        audit_rows = matrix["rows"].loc[matrix["audit_mask"]]
+        if set(audit_rows["query_id"].astype(str).unique()) != reference_query_ids:
+            raise DataContractError(
+                f"Train/audit variant {matrix['label']} changed audit query IDs."
+            )
+        if _audit_positive_signature(audit_rows) != reference_positive_signature:
+            raise DataContractError(
+                f"Train/audit variant {matrix['label']} changed positive candidates."
+            )
+        if len(audit_rows) != reference_audit_row_count:
+            raise DataContractError(
+                f"Train/audit variant {matrix['label']} changed audit candidate count."
+            )
 
-    _, manual_selection = _fit_and_score(
-        reference_rows, MANUAL_FEATURE_NAMES, train_mask, selection_mask
-    )
-    _, automatic_selection = _fit_and_score(
-        reference_rows, selected_features, train_mask, selection_mask
-    )
-    manual_model, manual_reference = _fit_and_score(
-        reference_rows,
-        MANUAL_FEATURE_NAMES,
-        train_and_selection,
-        audit_mask,
-        manual_selection["iterations"],
-    )
-    automatic_model, automatic_reference = _fit_and_score(
-        reference_rows,
-        selected_features,
-        train_and_selection,
-        audit_mask,
-        automatic_selection["iterations"],
-    )
-    models = {
-        "manual": {
-            "model": manual_model,
-            "features": MANUAL_FEATURE_NAMES,
-            "selection": manual_selection,
-            "reference_audit_metrics": manual_reference["metrics"],
-            "reference_query_ndcg": None,
-        },
-        "automatic": {
-            "model": automatic_model,
-            "features": selected_features,
-            "selection": automatic_selection,
-            "reference_audit_metrics": automatic_reference["metrics"],
-            "reference_query_ndcg": None,
-        },
-    }
-
-    for model_data in models.values():
-        reference_metrics, reference_ndcg = _evaluate_frozen_model(
-            model_data["model"],
-            reference_rows.loc[audit_mask],
-            model_data["features"],
+    cells: dict[tuple[str, str], dict[str, Any]] = {}
+    training_runs = []
+    for train_matrix in matrices:
+        rows = train_matrix["rows"]
+        train_mask = train_matrix["train_mask"]
+        selection_mask = train_matrix["selection_mask"]
+        audit_mask = train_matrix["audit_mask"]
+        train_and_selection = train_mask | selection_mask
+        _, manual_selection = _fit_and_score(
+            rows, MANUAL_FEATURE_NAMES, train_mask, selection_mask
         )
-        if reference_metrics["ndcg@3"] != model_data["reference_audit_metrics"]["ndcg@3"]:
-            raise DataContractError("Frozen reference audit metrics do not match.")
-        model_data["reference_query_ndcg"] = reference_ndcg
-
-    audit_query_ids = set(
-        reference_rows.loc[audit_mask, "query_id"].astype(str).unique()
-    )
-    audit_positive_signature = _audit_positive_signature(
-        reference_rows.loc[audit_mask]
-    )
-    audit_results = []
-    for matrix in matrices:
-        rows = matrix["rows"]
-        audit_rows = rows.loc[matrix["audit_mask"]]
-        current_query_ids = set(audit_rows["query_id"].astype(str).unique())
-        if current_query_ids != audit_query_ids:
-            raise DataContractError(
-                f"Frozen audit variant {matrix['label']} changed audit query IDs."
-            )
-        if _audit_positive_signature(audit_rows) != audit_positive_signature:
-            raise DataContractError(
-                f"Frozen audit variant {matrix['label']} changed positive candidates."
-            )
-
-        metrics = {}
-        paired_to_reference = {}
-        for model_name, model_data in models.items():
-            current_metrics, current_ndcg = _evaluate_frozen_model(
-                model_data["model"], audit_rows, model_data["features"]
-            )
-            metrics[model_name] = current_metrics
-            paired_to_reference[model_name] = (
-                None
-                if matrix["label"] == reference["label"]
-                else _paired_bootstrap(
-                    model_data["reference_query_ndcg"],
-                    current_ndcg,
-                    metric_name="audit_pool_minus_reference_ndcg@3",
-                )
-            )
-        audit_results.append(
+        _, automatic_selection = _fit_and_score(
+            rows, selected_features, train_mask, selection_mask
+        )
+        manual_model, _ = _fit_and_score(
+            rows,
+            MANUAL_FEATURE_NAMES,
+            train_and_selection,
+            audit_mask,
+            manual_selection["iterations"],
+        )
+        automatic_model, _ = _fit_and_score(
+            rows,
+            selected_features,
+            train_and_selection,
+            audit_mask,
+            automatic_selection["iterations"],
+        )
+        model_specs = {
+            "manual": {
+                "model": manual_model,
+                "features": MANUAL_FEATURE_NAMES,
+                "selection": manual_selection,
+            },
+            "automatic": {
+                "model": automatic_model,
+                "features": selected_features,
+                "selection": automatic_selection,
+            },
+        }
+        training_runs.append(
             {
-                "label": matrix["label"],
-                "input": matrix["input"],
-                "audit_query_count": len(current_query_ids),
-                "audit_rows": len(audit_rows),
-                "manual_metrics": metrics["manual"],
-                "automatic_metrics": metrics["automatic"],
-                "paired_audit_pool_change_vs_reference": paired_to_reference,
-                "feature_generation_seconds": matrix[
+                "training_variant": train_matrix["label"],
+                "training_input": train_matrix["input"],
+                "train_rows": int(train_mask.sum()),
+                "selection_rows": int(selection_mask.sum()),
+                "training_cutoffs": [str(value) for value in common_cutoffs],
+                "manual_selection": manual_selection,
+                "automatic_selection": automatic_selection,
+                "feature_generation_seconds": train_matrix[
                     "feature_generation_seconds"
                 ],
             }
         )
 
+        for audit_matrix in matrices:
+            audit_rows = audit_matrix["rows"].loc[audit_matrix["audit_mask"]]
+            cell_metrics = {}
+            cell_query_metrics = {}
+            for model_name, model_data in model_specs.items():
+                current_metrics, current_ndcg, current_recall = _evaluate_model(
+                    model_data["model"], audit_rows, model_data["features"]
+                )
+                cell_metrics[model_name] = current_metrics
+                cell_query_metrics[model_name] = {
+                    "ndcg@3": current_ndcg,
+                    "recall@3": current_recall,
+                }
+            paired = _paired_bootstrap(
+                cell_query_metrics["manual"]["ndcg@3"],
+                cell_query_metrics["automatic"]["ndcg@3"],
+                metric_name="automatic_minus_manual_ndcg@3",
+            )
+            cells[(train_matrix["label"], audit_matrix["label"])] = {
+                "train_variant": train_matrix["label"],
+                "audit_variant": audit_matrix["label"],
+                "manual_metrics": cell_metrics["manual"],
+                "automatic_metrics": cell_metrics["automatic"],
+                "paired_automatic_minus_manual": paired,
+                "query_metrics": cell_query_metrics,
+            }
+
+    training_reference = matrices[0]["label"]
+    audit_reference = matrices[0]["label"]
+
+    def paired_metric_report(
+        reference_cell: dict[str, Any],
+        comparison_cell: dict[str, Any],
+        metric_prefix: str,
+    ) -> dict[str, Any]:
+        result = {}
+        for model_name in ("manual", "automatic"):
+            result[model_name] = {}
+            for metric_name in ("ndcg@3", "recall@3"):
+                result[model_name][metric_name] = _paired_bootstrap(
+                    reference_cell["query_metrics"][model_name][metric_name],
+                    comparison_cell["query_metrics"][model_name][metric_name],
+                    metric_name=f"{metric_prefix}_{metric_name}",
+                )
+        return result
+
+    training_seed_effects = []
+    for audit_matrix in matrices:
+        for train_matrix in matrices[1:]:
+            training_seed_effects.append(
+                {
+                    "fixed_audit_variant": audit_matrix["label"],
+                    "reference_training_variant": training_reference,
+                    "comparison_training_variant": train_matrix["label"],
+                    "paired_metrics": paired_metric_report(
+                        cells[(training_reference, audit_matrix["label"])],
+                        cells[(train_matrix["label"], audit_matrix["label"])],
+                        "training_pool_change",
+                    ),
+                }
+            )
+
+    audit_seed_effects = []
+    for train_matrix in matrices:
+        for audit_matrix in matrices[1:]:
+            audit_seed_effects.append(
+                {
+                    "fixed_training_variant": train_matrix["label"],
+                    "reference_audit_variant": audit_reference,
+                    "comparison_audit_variant": audit_matrix["label"],
+                    "paired_metrics": paired_metric_report(
+                        cells[(train_matrix["label"], audit_reference)],
+                        cells[(train_matrix["label"], audit_matrix["label"])],
+                        "audit_pool_change",
+                    ),
+                }
+            )
+
+    interactions = []
+    for train_matrix in matrices[1:]:
+        for audit_matrix in matrices[1:]:
+            interaction = {
+                "training_comparison": train_matrix["label"],
+                "training_reference": training_reference,
+                "audit_comparison": audit_matrix["label"],
+                "audit_reference": audit_reference,
+                "metrics": {},
+            }
+            for model_name in ("manual", "automatic"):
+                interaction["metrics"][model_name] = {}
+                for metric_name in ("ndcg@3", "recall@3"):
+                    # Difference in training-pool effects between the comparison
+                    # audit pool and the reference audit pool.
+                    train_audit = cells[(train_matrix["label"], audit_matrix["label"])][
+                        "query_metrics"
+                    ][model_name][metric_name]
+                    reference_reference = cells[(training_reference, audit_reference)][
+                        "query_metrics"
+                    ][model_name][metric_name]
+                    reference_train = cells[(training_reference, audit_matrix["label"])][
+                        "query_metrics"
+                    ][model_name][metric_name]
+                    train_reference = cells[(train_matrix["label"], audit_reference)][
+                        "query_metrics"
+                    ][model_name][metric_name]
+                    positive = {
+                        key: train_audit[key] + reference_reference[key]
+                        for key in train_audit.keys()
+                        & reference_reference.keys()
+                        & reference_train.keys()
+                        & train_reference.keys()
+                    }
+                    negative = {
+                        key: reference_train[key] + train_reference[key]
+                        for key in positive
+                    }
+                    interaction["metrics"][model_name][metric_name] = _paired_bootstrap(
+                        negative,
+                        positive,
+                        metric_name="difference_in_training_effects",
+                    )
+            interactions.append(interaction)
+
+    diagonal_samples = []
+    for matrix in matrices:
+        cell = cells[(matrix["label"], matrix["label"])]
+        diagonal_samples.append(
+            {
+                "label": matrix["label"],
+                "input": matrix["input"],
+                "cutoffs": [str(value) for value in common_cutoffs],
+                "rows": {
+                    "train": int(matrix["train_mask"].sum()),
+                    "selection": int(matrix["selection_mask"].sum()),
+                    "audit": int(matrix["audit_mask"].sum()),
+                },
+                "audit_query_count": len(reference_query_ids),
+                "feature_generation_seconds": matrix[
+                    "feature_generation_seconds"
+                ],
+                "manual": {
+                    "selection": next(
+                        run["manual_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["manual_metrics"],
+                },
+                "automatic": {
+                    "selection": next(
+                        run["automatic_selection"]
+                        for run in training_runs
+                        if run["training_variant"] == matrix["label"]
+                    ),
+                    "audit": cell["automatic_metrics"],
+                },
+                "paired_automatic_minus_manual": cell[
+                    "paired_automatic_minus_manual"
+                ],
+                "audit_query_ndcg": {
+                    "manual": cell["query_metrics"]["manual"]["ndcg@3"],
+                    "automatic": cell["query_metrics"]["automatic"]["ndcg@3"],
+                },
+            }
+        )
+
+    serialized_cells = []
+    for cell in cells.values():
+        serialized_cells.append(
+            {
+                key: value
+                for key, value in cell.items()
+                if key != "query_metrics"
+            }
+        )
     return {
-        "training_variant": reference["label"],
-        "training_input": reference["input"],
-        "training_negative_seed": training_negative_seed,
-        "train_rows": int(train_mask.sum()),
-        "selection_rows": int(selection_mask.sum()),
+        "training_variants": [matrix["label"] for matrix in matrices],
+        "audit_variants": [matrix["label"] for matrix in matrices],
         "training_cutoffs": [str(value) for value in common_cutoffs],
-        "manual_training_iterations": manual_selection["iterations"],
-        "automatic_training_iterations": automatic_selection["iterations"],
-        "frozen_models": True,
         "same_audit_query_ids": True,
         "same_audit_positive_candidates": True,
-        "audit_samples": audit_results,
+        "same_audit_candidate_count": reference_audit_row_count,
+        "audit_query_count": len(reference_query_ids),
+        "training_runs": training_runs,
+        "cells": serialized_cells,
+        "training_seed_effects": training_seed_effects,
+        "audit_seed_effects": audit_seed_effects,
+        "train_audit_interactions": interactions,
+        "diagonal_samples": diagonal_samples,
+        "_query_metrics_by_cell": cells,
     }
 
 
@@ -635,17 +813,13 @@ def run_sampling_sensitivity(
         raise DataContractError("Filtered query-sensitivity cohorts still overlap.")
 
     started = time.perf_counter()
-    negative_samples = [
-        _fit_sample(label, path, history_path, specs, selected_features)
-        for label, path in filtered_negative_paths
-    ]
-    frozen_audit_sensitivity = _fit_frozen_audit_sensitivity(
+    negative_matrix = _fit_train_audit_matrix(
         tuple(filtered_negative_paths),
         history_path,
         specs,
         selected_features,
-        negative_group["variants"][0]["sampling"]["negative_sampling_seed"],
     )
+    negative_samples = negative_matrix["diagonal_samples"]
     query_samples = [
         _fit_sample(label, path, history_path, specs, selected_features)
         for label, path in filtered_query_paths
@@ -719,7 +893,11 @@ def run_sampling_sensitivity(
             },
             "samples": [_serialize_sample(sample) for sample in negative_samples],
             "paired_comparisons_to_first_pool": negative_comparisons,
-            "fixed_training_audit_sensitivity": frozen_audit_sensitivity,
+            "train_audit_matrix": {
+                key: value
+                for key, value in negative_matrix.items()
+                if not key.startswith("_") and key != "diagonal_samples"
+            },
         },
         "query_sampling": {
             "sampling_config": query_group,
