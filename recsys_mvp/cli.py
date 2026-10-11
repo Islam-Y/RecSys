@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from recsys_mvp.auto_features import ENTITIES, SEARCH_WINDOWS_DAYS
+from recsys_mvp.catboost_tuning import run_catboost_tuning
 from recsys_mvp.data import DataContractError, profile_data
 from recsys_mvp.feature_search import run_feature_search
 from recsys_mvp.features import WINDOWS_DAYS
@@ -284,6 +285,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     robust_search.add_argument("--feature-budget", type=int, default=12)
 
+    catboost_tuning = commands.add_parser(
+        "tune-catboost",
+        help="Tune a CatBoost classifier on discovery cohorts and score a holdout cohort.",
+    )
+    catboost_tuning.add_argument("discovery_inputs", type=Path, nargs="+")
+    catboost_tuning.add_argument("--holdout-input", type=Path, required=True)
+    catboost_tuning.add_argument("--event-history-input", type=Path, required=True)
+    catboost_tuning.add_argument(
+        "--output-dir", type=Path, default=Path("outputs/catboost-tuning")
+    )
+
     sampling_check = commands.add_parser(
         "sampling-sensitivity",
         help="Compare negative pools on fixed queries and metrics on disjoint query cohorts.",
@@ -417,6 +429,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "paired_audit_comparison": holdout[
                             "paired_audit_comparison"
                         ],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        if args.command == "tune-catboost":
+            report = run_catboost_tuning(
+                tuple(args.discovery_inputs),
+                args.holdout_input,
+                args.event_history_input,
+                args.output_dir,
+            )
+            print(
+                json.dumps(
+                    {
+                        "chosen": report["chosen"],
+                        "default_control": report["default_control"],
+                        "holdout": report["holdout"],
+                        "output": report["output"],
                     },
                     indent=2,
                     ensure_ascii=False,
