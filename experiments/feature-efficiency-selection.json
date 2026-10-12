@@ -1,0 +1,34 @@
+{
+  "source": "robust-search-features; discovery query seeds 42/43, four temporal folds",
+  "numeric_feature_budget": 8,
+  "selected_features": [
+    "item_listen_plus_count_180d",
+    "item_listen_plus_distinct_users_7d",
+    "item_listen_plus_mean_played_1d",
+    "item_listen_plus_distinct_users_30d",
+    "item_listen_short_mean_played_180d",
+    "item_listen_short_count_180d",
+    "item_listen_plus_mean_played_180d",
+    "item_listen_short_mean_played_7d"
+  ],
+  "excluded_candidate_files": [
+    "yambda_candidates.parquet",
+    "yambda_candidates_q45_n42.parquet",
+    "yambda_candidates_q45_n43.parquet",
+    "yambda_candidates_q45_n44.parquet",
+    "yambda_candidates_q46_n42.parquet",
+    "yambda_candidates_q47_n42.parquet",
+    "yambda_candidates_seed43.parquet",
+    "yambda_candidates_seed44.parquet",
+    "yambda_cold_pair_candidates.parquet",
+    "yambda_uniform_candidates.parquet",
+    "yambda_unseen_candidates.parquet",
+    "yambda_unseen_candidates_q45_n42.parquet",
+    "yambda_unseen_candidates_q45_n43.parquet",
+    "yambda_unseen_candidates_q45_n44.parquet",
+    "yambda_unseen_candidates_q46_n42.parquet",
+    "yambda_unseen_candidates_q47_n42.parquet",
+    "yambda_unseen_candidates_seed43.parquet",
+    "yambda_unseen_candidates_seed44.parquet"
+  ]
+}

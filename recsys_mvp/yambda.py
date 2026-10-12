@@ -223,6 +223,8 @@ def prepare_yambda_candidates(
     query_seed: int | None = None,
     popular_pool_cutoff_seconds: int | None = None,
     catalog_cutoff_seconds: int | None = None,
+    unseen_positive_only: bool = False,
+    excluded_query_inputs: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     """Prepare a small sampled next-listen ranking task from Yambda-50M.
 
@@ -259,6 +261,9 @@ def prepare_yambda_candidates(
     connection = duckdb.connect()
     try:
         connection.execute("SET preserve_insertion_order = false")
+        if unseen_positive_only:
+            connection.execute("SET threads = 4")
+            connection.execute("SET memory_limit = '6GB'")
         connection.execute(
             f"""
             CREATE TEMP VIEW yambda_source AS
@@ -344,6 +349,20 @@ def prepare_yambda_candidates(
         warmup_query_count = query_count - connection.execute(
             "SELECT COUNT(*) FROM selected_queries"
         ).fetchone()[0]
+        excluded_paths = tuple(path.expanduser().resolve() for path in excluded_query_inputs)
+        if excluded_paths:
+            for path in excluded_paths:
+                if not path.is_file() or path in {candidate_path, history_path}:
+                    raise DataContractError(f"Invalid excluded-query input: {path}")
+            paths_sql = ", ".join(quote_sql_string(str(path)) for path in excluded_paths)
+            connection.execute(
+                f"CREATE TEMP TABLE excluded_queries AS "
+                f"SELECT DISTINCT query_id FROM read_parquet([{paths_sql}])"
+            )
+            connection.execute(
+                "DELETE FROM selected_queries USING excluded_queries "
+                "WHERE selected_queries.query_id = excluded_queries.query_id"
+            )
         if connection.execute("SELECT COUNT(*) FROM selected_queries").fetchone()[0] < 3:
             raise DataContractError(
                 "Fewer than three candidate timestamps remain after the popularity-pool "
@@ -434,6 +453,26 @@ def prepare_yambda_candidates(
         )
         connection.execute(
             """
+            CREATE TEMP TABLE first_pair_events AS
+            SELECT user_id, item_id, MIN(event_time_seconds) AS first_event_seconds
+            FROM yambda_source GROUP BY user_id, item_id
+            """
+        )
+        if unseen_positive_only:
+            connection.execute(
+                """
+                CREATE TEMP TABLE repeated_target_queries AS
+                SELECT DISTINCT target.query_id FROM sampled_targets AS target
+                JOIN first_pair_events AS history USING (user_id, item_id)
+                WHERE history.first_event_seconds < target.event_time_seconds
+                """
+            )
+            connection.execute(
+                "DELETE FROM sampled_targets USING repeated_target_queries "
+                "WHERE sampled_targets.query_id = repeated_target_queries.query_id"
+            )
+        connection.execute(
+            """
             CREATE TEMP TABLE candidate_queries AS
             SELECT DISTINCT user_id, event_time_seconds, query_id
             FROM sampled_targets
@@ -448,17 +487,6 @@ def prepare_yambda_candidates(
                 "training-period catalog. Lower --query-sample-modulo and retry."
             )
 
-        connection.execute(
-            """
-            CREATE TEMP TABLE seen_before_query AS
-            SELECT q.query_id, e.item_id
-            FROM candidate_queries AS q
-            JOIN yambda_source AS e
-              ON e.user_id = q.user_id
-             AND e.event_time_seconds < q.event_time_seconds
-            GROUP BY q.query_id, e.item_id
-            """
-        )
         proposals_per_query = negatives_per_query * 8
         if negative_strategy == "uniform":
             strategy_expression = "'uniform'"
@@ -498,11 +526,12 @@ def prepare_yambda_candidates(
             ), eligible AS (
                 SELECT m.*
                 FROM mapped AS m
-                LEFT JOIN seen_before_query AS seen
-                  ON seen.query_id = m.query_id AND seen.item_id = m.item_id
+                LEFT JOIN first_pair_events AS seen
+                  ON seen.user_id = m.user_id AND seen.item_id = m.item_id
+                 AND seen.first_event_seconds < m.event_time_seconds
                 LEFT JOIN sampled_targets AS target
                   ON target.query_id = m.query_id AND target.item_id = m.item_id
-                WHERE seen.query_id IS NULL AND target.query_id IS NULL
+                WHERE seen.user_id IS NULL AND target.query_id IS NULL
                 QUALIFY ROW_NUMBER() OVER (
                     PARTITION BY m.query_id, m.item_id ORDER BY m.slot
                 ) = 1
@@ -584,6 +613,8 @@ def prepare_yambda_candidates(
                     "seed": seed,
                     "negative_sampling_seed": seed,
                     "query_seed": query_seed,
+                    "unseen_positive_only": unseen_positive_only,
+                    "excluded_query_inputs": [str(path) for path in excluded_paths],
                     "popular_pool_cutoff_seconds_requested": popular_pool_cutoff_seconds,
                     "catalog_cutoff_seconds_requested": catalog_cutoff_seconds,
                     "requested_negatives_per_query": negatives_per_query,

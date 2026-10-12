@@ -38,6 +38,7 @@ reports/
 models/
 
 # Logs and temporary files
+tmp/
 *.log
 *.tmp
 ~$*
