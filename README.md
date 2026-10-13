@@ -1,6 +1,6 @@
 # T-Lab 2026 — RecSys
 
-Отдельный проект для первого задания отбора T-Lab 2026: временные признаки, их автоматизированный поиск и бустинговый baseline.
+Проект для первого задания отбора T-Lab 2026: временные признаки, их автоматизированный поиск и бустинговый baseline.
 
 ## Материалы
 
@@ -276,7 +276,3 @@ python -m recsys_mvp.feature_efficiency
     python -m recsys_mvp baseline data/processed/yambda_candidates.parquet --history-input data/processed/yambda_history.parquet --output-dir outputs/feature-ablation/windows-plus-recency --windows-days 1,3,7,14,30,60,90 --include-recency --validation-only
 
 Имена колонок можно задать через `--user-column`, `--item-column`, `--timestamp-column`, `--label-column` и `--query-column`. JSON с метриками и модель сохраняются в `outputs/`; локальные результаты не попадают в Git.
-
-Второе задание посвящено последовательным рекомендациям и RL: [репозиторий RecSys-RL](https://github.com/Islam-Y/RecSys-RL).
-
-Страница отбора: [T-Lab 2026. RecSys](https://edu.tbank.ru/selection/01a10b8d-f3da-73a2-950e-5395aeccdb3d).
